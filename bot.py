@@ -1,0 +1,5178 @@
+from aiogram import types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from config import (
+    TELEGRAM_TOKEN, DEPOSIT_AMOUNTS, CASINO_NAME,
+    SUPPORTED_ASSETS, DEFAULT_ASSET, DEFAULT_CURRENCY_TYPE, DEFAULT_FIAT,
+    INVOICE_EXPIRES_IN, MIN_DEPOSIT, MAX_DEPOSIT, MIN_WITHDRAWAL,
+    DUEL_FAQ_URL, DICE_FAQ_URL, BASKETBALL_FAQ_URL, SLOTS_FAQ_URL,
+    BLACKJACK_FAQ_URL, DARTS_FAQ_URL, BACKGROUND_IMAGE_URL,
+    ADMIN_IDS, REFERRAL_BONUS, REFERRAL_MIN_DEPOSIT, DAILY_TASKS, GROUPS,
+    DEFAULT_GAME_SETTINGS
+)
+
+# URL изображений для результатов игр
+WIN_IMAGE_URL = "https://www.dropbox.com/scl/fi/7g0gaxdpd9yib3njcvknv/winsvanish.png?rlkey=gkm3ifwgtlndkelab9mqla57h&st=ym57ciur&dl=0"
+LOSE_IMAGE_URL = "https://www.dropbox.com/scl/fi/7djvu9ovgiy5yxgx8wi3i/losevanish.png?rlkey=1tjmth9haf4dcjnnfcba6kyt3&st=p10ekrvb&dl=0"
+from async_database import AsyncDatabase
+
+# Создаем экземпляр базы данных
+async_db = AsyncDatabase()
+from crypto_bot import crypto_bot
+import asyncio
+import random
+import time
+from datetime import date, datetime
+
+# Глобальные переменные
+bot = None
+dp = None
+results_group_id = None  # ID группы для отправки результатов игр
+vip_group_id = None  # ID VIP группы для отправки выплат
+
+# Кэш топов
+top_deposited_cache = []
+top_spent_cache = []
+top_referrals_cache = []
+last_cache_update = 0
+CACHE_UPDATE_INTERVAL = 120  # 2 минуты в секундах
+top_cache_lock = asyncio.Lock()  # Защита от race conditions
+
+# Кэш балансов пользователей
+user_balance_cache = {}
+user_cache_expiry = {}
+BALANCE_CACHE_TTL = 30  # 30 секунд
+balance_cache_lock = asyncio.Lock()  # Защита от race conditions
+
+# Кэш статистики пользователей
+user_stats_cache = {}
+user_stats_cache_expiry = {}
+STATS_CACHE_TTL = 60  # 60 секунд
+stats_cache_lock = asyncio.Lock()  # Защита от race conditions
+
+# Rate limiting для ежедневного бонуса
+daily_bonus_attempts = {}
+DAILY_BONUS_COOLDOWN = 0  # Убрана задержка для мгновенного отклика
+
+# Rate limiting для команд
+command_rate_limits = {}
+COMMAND_COOLDOWN = 0.0  # Убрана задержка для мгновенного отклика
+
+# Rate limiting для callback
+callback_rate_limits = {}
+CALLBACK_COOLDOWN = 0.0  # Убрана задержка для мгновенного отклика
+
+async def check_command_rate_limit(user_id, command):
+    """Проверка rate limiting для команд"""
+    current_time = time.time()
+    key = f"{user_id}_{command}"
+
+    last_use = command_rate_limits.get(key, 0)
+    if current_time - last_use < COMMAND_COOLDOWN:
+        return False
+
+    command_rate_limits[key] = current_time
+    return True
+
+async def check_callback_rate_limit(user_id, callback_data):
+    """Проверка rate limiting для callback"""
+    current_time = time.time()
+    key = f"{user_id}_{callback_data}"
+
+    last_use = callback_rate_limits.get(key, 0)
+    if current_time - last_use < CALLBACK_COOLDOWN:
+        return False
+
+    callback_rate_limits[key] = current_time
+    return True
+
+# Очередь для отправки сообщений в группы
+group_message_queue = asyncio.Queue()
+group_message_lock = asyncio.Lock()
+
+# Функция для удаления уведомления через заданное время
+async def delete_notification_after_delay(chat_id, message_id, delay_seconds):
+    """Удаляет сообщение через заданное количество секунд"""
+    try:
+        await asyncio.sleep(delay_seconds)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        print(f"Уведомление удалено: chat_id={chat_id}, message_id={message_id}")
+    except Exception as e:
+        print(f"Ошибка удаления уведомления: {e}")
+
+# Асинхронная отправка результатов игры в группу (без блокировки)
+async def send_game_result_to_group(game_name, username, bet, result_text, winnings_label, winnings):
+    """Асинхронная отправка результата игры в группу"""
+    if not results_group_id:
+        return
+
+    try:
+        group_text = f"""📎 Игра: {game_name}
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+
+        photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+
+        # Отправляем без ожидания
+        asyncio.create_task(
+            bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+        )
+    except Exception as e:
+        print(f"Ошибка отправки в группу: {e}")
+
+# Асинхронные функции БД (используем async_db напрямую)
+async def async_get_user(telegram_id):
+    """Получение пользователя из БД"""
+    return await async_db.get_user(telegram_id)
+
+async def async_get_user_by_username(username):
+    """Получение пользователя по username из БД"""
+    return await async_db.get_user_by_username(username)
+
+async def async_create_user(telegram_id, username, referrer_id=None):
+    """Создание пользователя в БД"""
+    await async_db.create_user(telegram_id, username, referrer_id)
+
+async def async_update_balance(telegram_id, amount):
+    """Обновление баланса пользователя"""
+    await async_db.update_balance(telegram_id, amount)
+
+async def async_update_referral_balance(telegram_id, amount):
+    """Обновление реферального баланса"""
+    await async_db.update_referral_balance(telegram_id, amount)
+
+async def async_get_top_deposited(limit=5):
+    """Получение топа по пополнениям"""
+    return await async_db.get_top_deposited(limit)
+
+async def async_get_top_spent(limit=5):
+    """Получение топа по тратам"""
+    return await async_db.get_top_spent(limit)
+
+async def async_get_top_referrals(limit=5):
+    """Получение топа по рефералам"""
+    return await async_db.get_top_referrals(limit)
+
+async def async_load_all_game_settings():
+    """Загрузка всех настроек игр"""
+    return await async_db.load_all_game_settings()
+
+async def async_save_game_setting(key, value):
+    """Сохранение настройки игры"""
+    await async_db.save_game_setting(key, value)
+
+async def async_save_setting(key, value):
+    """Сохранение текстовой настройки"""
+    await async_db.save_setting(key, value)
+
+async def async_create_withdrawal(user_id, amount, wallet_address):
+    """Создание заявки на вывод"""
+    return await async_db.create_withdrawal(user_id, amount, wallet_address)
+
+async def async_update_withdrawal_status(withdrawal_id, status, transfer_id=None):
+    """Обновление статуса вывода"""
+    await async_db.update_withdrawal_status(withdrawal_id, status, transfer_id)
+
+async def async_create_promo_code(code, reward_amount, max_activations, expires_at, created_by):
+    """Создание промокода"""
+    return await async_db.create_promo_code(code, reward_amount, max_activations, expires_at, created_by)
+
+async def async_get_promo_code(code):
+    """Получение промокода по коду"""
+    return await async_db.get_promo_code(code)
+
+async def async_activate_promo_code(promo_code_id, user_id):
+    """Активация промокода пользователем"""
+    return await async_db.activate_promo_code(promo_code_id, user_id)
+
+async def async_get_all_promo_codes():
+    """Получение всех промокодов"""
+    return await async_db.get_all_promo_codes()
+
+async def async_log_action(telegram_id, action, amount=0, reason=""):
+    """Логирование действия пользователя"""
+    await async_db.log_action(telegram_id, action, amount, reason)
+
+async def async_get_user_logs(telegram_id=None, limit=50):
+    """Получение логов пользователя"""
+    return await async_db.get_user_logs(telegram_id, limit)
+
+async def async_get_user_stats(limit=50):
+    """Получение статистики пользователей"""
+    # Получаем пользователей с балансами и рефералами через async_db
+    users = []
+    # Используем прямой SQL запрос через async_db для статистики
+    result = await asyncio.to_thread(async_db._execute_query,
+        "SELECT username, balance, referral_count FROM users ORDER BY balance DESC LIMIT ?",
+        (limit,), fetchall=True)
+    return result
+
+async def async_get_user_logs_by_username(username=None, limit=50):
+    """Получение логов по username"""
+    if not username:
+        return await async_get_user_logs(limit=limit)
+    # Получаем telegram_id по username через async_db
+    user = await async_get_user(username)
+    if user:
+        telegram_id = user[1]  # telegram_id находится в user[1]
+        return await async_get_user_logs(telegram_id, limit)
+    else:
+        return []
+
+async def async_get_payment_by_invoice(invoice_id):
+    """Получение платежа по invoice_id"""
+    return await async_db.get_payment_by_invoice(invoice_id)
+
+async def async_get_telegram_id_by_user_id(user_id):
+    """Получение telegram_id по user_id"""
+    return await async_db.get_telegram_id_by_user_id(user_id)
+
+async def async_get_pending_payments(telegram_id):
+    """Получение pending платежей пользователя"""
+    return await async_db.get_pending_payments(telegram_id)
+
+async def async_get_payment_amount_by_invoice(invoice_id):
+    """Получение суммы платежа по invoice_id"""
+    return await async_db.get_payment_amount_by_invoice(invoice_id)
+
+async def async_get_setting(key, default_value=None):
+    """Получение текстовой настройки"""
+    return await async_db.get_setting(key, default_value)
+
+async def async_update_games_played(telegram_id):
+    """Обновление счетчика игр"""
+    await async_db.update_games_played(telegram_id)
+
+async def async_update_payment_status(invoice_id, status):
+    """Обновление статуса платежа"""
+    await async_db.update_payment_status(invoice_id, status)
+
+# Функция предварительной загрузки данных
+async def preload_data():
+    """Предварительная загрузка часто используемых данных для ускорения работы"""
+    global top_deposited_cache, top_spent_cache, top_referrals_cache, last_cache_update
+
+    try:
+        # Загружаем топы сразу
+        async with top_cache_lock:
+            top_deposited_cache = await async_get_top_deposited(5)
+            top_spent_cache = await async_get_top_spent(5)
+            top_referrals_cache = await async_get_top_referrals(5)
+            last_cache_update = time.time()
+
+        # Загружаем настройки игр
+        global settings
+        settings = await async_load_all_game_settings()
+
+        # Запускаем очистку rate limiting кэша
+        asyncio.create_task(cleanup_rate_limit_cache())
+
+        # Запускаем обработчик очереди сообщений в группы
+        asyncio.create_task(process_group_message_queue())
+
+        # Запускаем автоматическую проверку платежей
+        asyncio.create_task(auto_check_payments())
+
+        print("✅ Предварительная загрузка завершена")
+    except Exception as e:
+        print(f"⚠️ Ошибка предзагрузки: {e}")
+
+# Функция обновления кэша топов
+async def update_top_cache():
+    global top_deposited_cache, top_spent_cache, top_referrals_cache, last_cache_update
+    while True:
+        current_time = time.time()
+        if current_time - last_cache_update >= CACHE_UPDATE_INTERVAL:
+            async with top_cache_lock:
+                top_deposited_cache = await async_get_top_deposited(5)
+                top_spent_cache = await async_get_top_spent(5)
+                top_referrals_cache = await async_get_top_referrals(5)
+                last_cache_update = current_time
+                print("Кэш топов обновлен")
+        await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+
+# Функция получения топов из кэша
+async def get_cached_tops():
+    global top_deposited_cache, top_spent_cache, top_referrals_cache, last_cache_update
+    current_time = time.time()
+    if current_time - last_cache_update >= CACHE_UPDATE_INTERVAL:
+        # Если кэш устарел, обновляем асинхронно
+        async with top_cache_lock:
+            top_deposited_cache = await async_get_top_deposited(5)
+            top_spent_cache = await async_get_top_spent(5)
+            top_referrals_cache = await async_get_top_referrals(5)
+            last_cache_update = current_time
+    return top_deposited_cache, top_spent_cache, top_referrals_cache
+
+# Функция получения баланса из кэша (асинхронная)
+async def get_cached_balance(user_id):
+    async with balance_cache_lock:
+        global user_balance_cache, user_cache_expiry
+        current_time = time.time()
+
+        # Очищаем устаревший кэш
+        expired_users = [uid for uid, expiry in user_cache_expiry.items() if current_time > expiry]
+        for uid in expired_users:
+            user_balance_cache.pop(uid, None)
+            user_cache_expiry.pop(uid, None)
+
+        # Проверяем кэш
+        if user_id in user_balance_cache and current_time <= user_cache_expiry.get(user_id, 0):
+            return user_balance_cache[user_id]
+
+        # Загружаем из БД и кэшируем
+        user_data = await async_get_user(user_id)
+        if user_data:
+            balance = round(float(user_data[3]), 2) if user_data[3] is not None else 0
+            referral_balance = round(float(user_data[5]), 2) if user_data[5] is not None else 0
+            user_balance_cache[user_id] = (balance, referral_balance)
+            user_cache_expiry[user_id] = current_time + BALANCE_CACHE_TTL
+            return balance, referral_balance
+
+        return 0, 0
+
+# Функция получения статистики из кэша (асинхронная)
+async def get_cached_user_stats(user_id):
+    async with stats_cache_lock:
+        global user_stats_cache, user_stats_cache_expiry
+        current_time = time.time()
+
+        # Очищаем устаревший кэш
+        expired_users = [uid for uid, expiry in user_stats_cache_expiry.items() if current_time > expiry]
+        for uid in expired_users:
+            user_stats_cache.pop(uid, None)
+            user_stats_cache_expiry.pop(uid, None)
+
+        # Проверяем кэш
+        if user_id in user_stats_cache and current_time <= user_stats_cache_expiry.get(user_id, 0):
+            return user_stats_cache[user_id]
+
+        # Загружаем из БД и кэшируем
+        user_data = await async_get_user(user_id)
+        if user_data:
+            username = user_data[2] or "Не указан"
+            balance = round(float(user_data[3]), 2) if user_data[3] is not None else 0
+            referral_count = user_data[4] if user_data[4] is not None else 0
+            referral_balance = round(float(user_data[5]), 2) if user_data[5] is not None else 0
+            total_deposited = round(float(user_data[6]), 2) if user_data[6] is not None else 0
+            total_spent = round(float(user_data[7]), 2) if user_data[7] is not None else 0
+            games_played = user_data[8] if user_data[8] is not None else 0
+            created_at = user_data[12] if len(user_data) > 12 and user_data[12] else "Неизвестно"
+
+            # Вычисляем дополнительные метрики
+            net_profit = total_deposited - total_spent
+            win_rate = 0
+            if games_played > 0:
+                win_rate = min(100, max(0, (balance + total_spent - total_deposited) / max(1, total_spent) * 100))
+            avg_bet = total_spent / max(1, games_played)
+            profit_per_game = (total_deposited - total_spent) / max(1, games_played)
+
+            stats = {
+                'username': username,
+                'balance': balance,
+                'referral_count': referral_count,
+                'referral_balance': referral_balance,
+                'total_deposited': total_deposited,
+                'total_spent': total_spent,
+                'games_played': games_played,
+                'created_at': created_at,
+                'net_profit': net_profit,
+                'win_rate': win_rate,
+                'avg_bet': avg_bet,
+                'profit_per_game': profit_per_game
+            }
+
+            # Добавляем active_referrals_count в статистику
+            user_data = await async_get_user(user_id)
+            active_referrals_count = user_data[12] if user_data and len(user_data) > 12 else 0
+            stats['active_referrals_count'] = active_referrals_count
+
+            user_stats_cache[user_id] = stats
+            user_stats_cache_expiry[user_id] = current_time + STATS_CACHE_TTL
+            return stats
+
+        return None
+
+# Функция инвалидации кэша баланса при изменении
+async def invalidate_balance_cache(user_id):
+    async with balance_cache_lock:
+        global user_balance_cache, user_cache_expiry
+        user_balance_cache.pop(user_id, None)
+        user_cache_expiry.pop(user_id, None)
+
+# Функция инвалидации кэша статистики при изменении
+async def invalidate_stats_cache(user_id):
+    async with stats_cache_lock:
+        global user_stats_cache, user_stats_cache_expiry
+        user_stats_cache.pop(user_id, None)
+        user_stats_cache_expiry.pop(user_id, None)
+
+# Безопасный callback answer
+async def safe_callback_answer(callback_query, text=None, show_alert=False):
+    """Безопасный вызов callback_query.answer() с обработкой ошибок"""
+    try:
+        await callback_query.answer(text, show_alert)
+    except Exception as e:
+        # Игнорировать ошибки timeout и другие ошибки callback
+        if "query is too old" in str(e) or "timeout" in str(e) or "Bad Request" in str(e):
+            pass  # Это нормально для старых callback'ов
+        else:
+            print(f"Ошибка callback answer: {e}")
+
+# Функция получения задания дня
+def get_daily_task():
+    today = date.today()
+    day_index = (today.toordinal() - date(2025, 9, 19).toordinal()) % len(DAILY_TASKS)
+    return DAILY_TASKS[day_index]
+
+# Функция очистки rate limiting кэша
+async def cleanup_rate_limit_cache():
+    while True:
+        current_time = time.time()
+        # Удаляем записи старше 5 минут
+        expired_users = [uid for uid, timestamp in daily_bonus_attempts.items()
+                        if current_time - timestamp > 300]
+        for uid in expired_users:
+            del daily_bonus_attempts[uid]
+
+        # Очищаем общий rate limiting кэш команд
+        expired_commands = [key for key, timestamp in command_rate_limits.items()
+                           if current_time - timestamp > 300]
+        for key in expired_commands:
+            del command_rate_limits[key]
+
+        await asyncio.sleep(300)  # Очищаем каждые 5 минут
+
+# Функция обработки очереди сообщений в группы
+async def process_group_message_queue():
+    """Асинхронная обработка очереди сообщений в группы"""
+    while True:
+        try:
+            # Получаем сообщение из очереди
+            message_data = await group_message_queue.get()
+
+            if message_data['type'] == 'game_result':
+                group_id = message_data['group_id']
+                photo_url = message_data['photo_url']
+                caption = message_data['caption']
+
+                try:
+                    await bot.send_photo(chat_id=group_id, photo=photo_url, caption=caption)
+                    print(f"Результат игры отправлен в группу {group_id}")
+                except Exception as e:
+                    print(f"Ошибка отправки в группу {group_id}: {e}")
+
+            elif message_data['type'] == 'withdrawal_result':
+                group_id = message_data['group_id']
+                text = message_data['text']
+
+                try:
+                    await bot.send_message(chat_id=group_id, text=text)
+                    print(f"Результат вывода отправлен в группу {group_id}")
+                except Exception as e:
+                    print(f"Ошибка отправки в VIP группу {group_id}: {e}")
+
+            group_message_queue.task_done()
+
+        except Exception as e:
+            print(f"Ошибка обработки очереди сообщений: {e}")
+            await asyncio.sleep(1)  # Небольшая пауза при ошибке
+
+# Функция добавления сообщения в очередь
+async def queue_group_message(message_data):
+    """Добавление сообщения в очередь для отправки в группу"""
+    await group_message_queue.put(message_data)
+
+# Функция проверки выполнения задания
+def check_daily_task_completion(user_data, task):
+    if task["type"] == "referrals":
+        # Используем active_referrals_count (рефералы, пополнившие баланс на 2$+)
+        # вместо referral_count (все приглашенные рефералы)
+        active_referrals_count = user_data[12] if len(user_data) > 12 else 0
+        return active_referrals_count >= task["target"]
+    elif task["type"] == "spent":
+        return user_data[7] >= task["target"]  # total_spent
+    elif task["type"] == "deposited":
+        return user_data[6] >= task["target"]  # total_deposited
+    elif task["type"] == "games":
+        return user_data[8] >= task["target"]  # games_played
+    return False
+
+# Загрузка настроек из базы данных (асинхронно)
+async def load_initial_settings():
+    global settings, results_group_id, vip_group_id
+    try:
+        settings = await async_load_all_game_settings()
+        results_group_id_raw = await async_get_setting('results_group_id')
+        print(f"Загружено из БД results_group_id: '{results_group_id_raw}', type: {type(results_group_id_raw)}")
+        if results_group_id_raw:
+            try:
+                results_group_id = int(results_group_id_raw)
+                print(f"Загружена группа для результатов: {results_group_id}")
+            except ValueError:
+                print(f"Ошибка преобразования results_group_id: {results_group_id_raw}")
+                results_group_id = None
+        else:
+            print("❌ Группа для результатов не установлена!")
+            print("📋 Для отправки результатов игр в группу используйте команду:")
+            print("   /setgroup <ID_группы>")
+            print("   Или отправьте эту команду в нужной группе")
+            results_group_id = None
+
+        # Загрузка ID VIP группы из базы данных
+        vip_group_id_raw = await async_get_setting('vip_group_id')
+        print(f"Загружено из БД vip_group_id: '{vip_group_id_raw}', type: {type(vip_group_id_raw)}")
+        if vip_group_id_raw:
+            try:
+                vip_group_id = int(vip_group_id_raw)
+                print(f"Загружена VIP группа: {vip_group_id}")
+            except ValueError:
+                print(f"Ошибка преобразования vip_group_id: {vip_group_id_raw}")
+                vip_group_id = None
+        else:
+            print("❌ VIP группа не установлена!")
+            print("💎 Для отправки результатов выплат в VIP группу используйте команду:")
+            print("   /setvip <ID_VIP_группы>")
+            print("   Или отправьте эту команду в нужной VIP группе")
+            vip_group_id = None
+    except Exception as e:
+        print(f"Ошибка загрузки настроек: {e}")
+
+# Синхронная заглушка для обратной совместимости
+settings = {}
+
+# Шансы выигрыша (в процентах)
+DUEL_WIN_CHANCE = settings.get('duel_win_chance', 25.0)
+DICE_WIN_CHANCE = settings.get('dice_win_chance', 30.0)
+BASKETBALL_WIN_CHANCE = settings.get('basketball_win_chance', 10.0)
+SLOTS_WIN_CHANCE = settings.get('slots_win_chance', 15.0)
+BLACKJACK_WIN_CHANCE = settings.get('blackjack_win_chance', 40.0)
+
+# Множители выигрыша
+DUEL_MULTIPLIER = settings.get('duel_multiplier', 1.8)
+DICE_MULTIPLIER = settings.get('dice_multiplier', 5.0)
+BASKETBALL_MULTIPLIER = settings.get('basketball_multiplier', 1.5)
+SLOTS_MULTIPLIER = settings.get('slots_multiplier', 8.0)
+BLACKJACK_MULTIPLIER = settings.get('blackjack_multiplier', 2.0)
+
+# Состояния для FSM
+class DepositStates(StatesGroup):
+    waiting_for_amount = State()
+
+class DuelStates(StatesGroup):
+    waiting_for_bet = State()
+
+class DiceStates(StatesGroup):
+    waiting_for_number = State()
+    waiting_for_bet = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_duel_chance = State()
+    waiting_for_dice_chance = State()
+    waiting_for_basketball_chance = State()
+    waiting_for_slots_chance = State()
+    waiting_for_blackjack_chance = State()
+    waiting_for_duel_multiplier = State()
+    waiting_for_dice_multiplier = State()
+    waiting_for_basketball_multiplier = State()
+    waiting_for_slots_multiplier = State()
+    waiting_for_blackjack_multiplier = State()
+
+class WithdrawStates(StatesGroup):
+    waiting_for_wallet_address = State()
+    waiting_for_withdraw_amount = State()
+
+class PromoStates(StatesGroup):
+    waiting_for_promo_code = State()
+    waiting_for_promo_amount = State()
+    waiting_for_promo_max_activations = State()
+    waiting_for_promo_expires = State()
+
+class BasketballStates(StatesGroup):
+    waiting_for_bet = State()
+
+class SlotsStates(StatesGroup):
+    waiting_for_bet = State()
+
+class BlackjackStates(StatesGroup):
+    waiting_for_bet = State()
+
+# Главное меню
+async def get_main_menu(user_id=None):
+    from datetime import date
+
+    # Проверяем, нужно ли показывать кнопку ежедневного бонуса
+    show_daily_bonus = True
+    if user_id:
+        try:
+            user_data = await async_get_user(user_id)
+            today = date.today()
+            last_completed = user_data[11] if user_data and len(user_data) > 11 else None
+
+            # Скрываем кнопку если бонус уже получен сегодня
+            if last_completed and last_completed == str(today):
+                show_daily_bonus = False
+        except Exception as e:
+            print(f"Ошибка проверки ежедневного бонуса: {e}")
+            show_daily_bonus = True  # Показываем по умолчанию при ошибке
+
+    # Формируем клавиатуру
+    inline_keyboard = [
+        [
+            InlineKeyboardButton(text="🎮 ИГРАТЬ СЕЙЧАС", callback_data="play"),
+            InlineKeyboardButton(text="👥 РЕФЕРАЛЫ 💰", callback_data="referral")
+        ],
+        [
+            InlineKeyboardButton(text="👤 МОЙ ПРОФИЛЬ", callback_data="profile"),
+            InlineKeyboardButton(text="📊 ТОП ИГРОКОВ", callback_data="rating")
+        ],
+        [
+            InlineKeyboardButton(text="💰 ПОПОЛНИТЬ 💳", callback_data="deposit"),
+            InlineKeyboardButton(text="💸 ВЫВЕСТИ 💎", callback_data="withdraw")
+        ]
+    ]
+
+    # Добавляем строку с ежедневным бонусом только если нужно показать
+    if show_daily_bonus:
+        inline_keyboard.append([
+            InlineKeyboardButton(text="🎁 ЕЖЕДНЕВНЫЙ БОНУС", callback_data="daily_bonus"),
+            InlineKeyboardButton(text="👥 НАШИ ГРУППЫ", callback_data="groups")
+        ])
+    else:
+        inline_keyboard.append([
+            InlineKeyboardButton(text="👥 НАШИ ГРУППЫ", callback_data="groups")
+        ])
+
+    inline_keyboard.append([InlineKeyboardButton(text="🎫 ПРОМОКОДЫ 🎉", callback_data="promo_codes")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+    return keyboard
+
+def get_admin_panel():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Шансы", callback_data="admin_chances")],
+        [InlineKeyboardButton(text="⚡ Множитель", callback_data="admin_multiplier")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💰 Установить баланс", callback_data="admin_set_balance")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+    return keyboard
+
+# Кнопки пополнения
+def get_deposit_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Ввести сумму", callback_data="dep_custom")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+    return keyboard
+
+# Кнопка назад
+def get_back_button():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+    return keyboard
+
+# Меню игр
+def get_games_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎲 Кости", callback_data="game_duel"),
+            InlineKeyboardButton(text="🎁 Кубикии", callback_data="game_dice"),
+            InlineKeyboardButton(text="🏀 Баскетбол", callback_data="game_basketball")
+        ],
+        [
+            InlineKeyboardButton(text="🎰 Слоты", callback_data="game_slots"),
+            InlineKeyboardButton(text="🃏 BlackJack", callback_data="game_blackjack"),
+            InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+        ]
+    ])
+    return keyboard
+
+def get_deposit_back_button():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="deposit")]])
+    return keyboard
+
+# Меню групп
+def get_groups_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"👥 {group['name']}", url=group['url'])] for group in GROUPS
+    ] + [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+    return keyboard
+
+# Меню промокодов
+def get_promo_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎫 Активировать промокод", callback_data="activate_promo")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+    return keyboard
+
+async def get_welcome_text(user):
+    """Генерирует приветственное сообщение с актуальным балансом"""
+    # Получаем свежий баланс напрямую из базы данных (без кэша)
+    user_data = await async_get_user(user.id)
+    if user_data:
+        balance = round(float(user_data[3]), 2) if user_data[3] is not None else 0
+        referral_balance = round(float(user_data[5]), 2) if user_data[5] is not None else 0
+    else:
+        balance = 0
+        referral_balance = 0
+
+    print(f"Актуальный баланс пользователя {user.id}: основной {balance}, реферальный {referral_balance}")
+
+    # Формируем приветствие
+    if user.username:
+        greeting = f"Привет, @<b><u>{user.username}</u></b> !"
+    elif user.first_name:
+        greeting = f"Привет, <b>{user.first_name}</b>!"
+    else:
+        greeting = "Привет!"
+
+    # Получаем задание дня
+    task = get_daily_task()
+
+    welcome_text = f"""🎰 <b>{CASINO_NAME}</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
+
+ {greeting}!
+
+ 🎁 <b>Задание дня:</b> {task['description']}
+ 💰 Награда: {task['reward']}$ ✨
+
+ <blockquote> <b>🌟 Работы без выходных!</b> </blockquote>
+ <blockquote> <b>⏰ Круглосуточно!</b> </blockquote>
+ <blockquote> <b>💎 Мгновенные выплаты!</b> </blockquote>
+ <blockquote> <b>🔥 Выигрыши до x8!</b> </blockquote>
+
+ 💰 <b>Баланс:</b> <code>{balance}$</code>
+ ⚡ <b>Реферальный:</b> <code>{referral_balance}$</code>
+
+ 🚀 <i>Выберите действие ниже!</i>"""
+
+    return welcome_text, "HTML"
+
+# Обработчик /start и /restart
+async def start_command(message: types.Message):
+    user = message.from_user
+
+    # Проверяем реферальную ссылку
+    args = message.text.split()
+    referrer_id = None
+    if len(args) > 1 and args[1].isdigit():
+        potential_referrer_id = int(args[1])
+        # Проверяем, что пользователь не приглашает сам себя
+        if potential_referrer_id != user.id:
+            referrer_id = potential_referrer_id
+
+    await async_create_user(user.id, user.username, referrer_id)
+
+    welcome_text, parse_mode = await get_welcome_text(user)
+    main_menu = await get_main_menu(user.id)
+    await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+
+# Обработчик /give для админов
+async def give_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'give'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply("Использование: /give @username amount или /give telegram_id amount\nПример: /give @testuser 10.5 или /give 123456789 10.5")
+        return
+
+    identifier = args[1]
+    telegram_id = None
+    username = None
+
+    # Определяем, username или telegram_id
+    if identifier.isdigit():
+        telegram_id = int(identifier)
+    else:
+        username = identifier
+        if username.startswith('@'):
+            username = username[1:]  # Убрать @
+
+    try:
+        amount = float(args[2])
+    except ValueError:
+        await message.reply("❌ Неверная сумма")
+        return
+
+    # Найти user
+    try:
+        if telegram_id:
+            user_data = await async_get_user(telegram_id)
+        else:
+            user_data = await async_get_user_by_username(username)
+        if not user_data:
+            await message.reply("❌ Пользователь не найден")
+            return
+
+        user_telegram_id = user_data[1]  # telegram_id
+        user_username = user_data[2] or f"ID:{user_telegram_id}"  # username
+
+        await async_update_balance(user_telegram_id, amount)
+        await invalidate_balance_cache(user_telegram_id)
+        # Логируем выдачу денег админом
+        await async_log_action(user_telegram_id, "admin_give", amount, f"Выдано админом {message.from_user.id}")
+        await message.reply(f"✅ Выдано {amount}$ пользователю @{user_username}")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка базы данных: {e}")
+
+# Обработчик /stats для админов
+async def stats_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'stats'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    # Получаем всех пользователей асинхронно
+    try:
+        users = await async_get_user_stats(limit=50)
+
+        if not users:
+            await message.reply("📊 Статистика пользователей:\n\n❌ Пользователей не найдено")
+            return
+
+        stats_text = "📊 Статистика пользователей:\n\n"
+        for i, (username, balance, referral_count) in enumerate(users, 1):
+            username = username or f"User{i}"
+            balance = round(float(balance), 2) if balance is not None else 0
+            referral_count = referral_count or 0
+            stats_text += f"{i}. @{username} - Баланс: {balance}$ - Рефералы: {referral_count}\n"
+
+        await message.reply(stats_text)
+    except Exception as e:
+        await message.reply(f"❌ Ошибка получения статистики: {e}")
+
+# Обработчик /set для админов
+async def set_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply("Использование: /set @username amount или /set telegram_id amount\nПример: /set @testuser 500 или /set 123456789 500")
+        return
+
+    identifier = args[1]
+    telegram_id = None
+    username = None
+
+    # Определяем, username или telegram_id
+    if identifier.isdigit():
+        telegram_id = int(identifier)
+    else:
+        username = identifier
+        if username.startswith('@'):
+            username = username[1:]  # Убрать @
+
+    try:
+        amount = float(args[2])
+    except ValueError:
+        await message.reply("❌ Неверная сумма")
+        return
+
+    # Найти user
+    try:
+        if telegram_id:
+            user_data = await async_get_user(telegram_id)
+        else:
+            user_data = await async_get_user_by_username(username)
+        if not user_data:
+            await message.reply("❌ Пользователь не найден")
+            return
+
+        user_telegram_id = user_data[1]  # telegram_id
+        current_balance = user_data[3]  # balance
+        user_username = user_data[2] or f"ID:{user_telegram_id}"  # username
+
+        # Устанавливаем новый баланс (amount - current_balance даст нужную разницу)
+        balance_diff = amount - (current_balance if current_balance is not None else 0)
+        await async_update_balance(user_telegram_id, balance_diff)
+        await invalidate_balance_cache(user_telegram_id)
+        # Логируем установку баланса админом
+        await async_log_action(user_telegram_id, "admin_set_balance", balance_diff, f"Баланс установлен админом {message.from_user.id} на {amount}$")
+        await message.reply(f"✅ Баланс пользователя @{user_username} установлен на {amount}$")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка базы данных: {e}")
+
+# Обработчик /chat для админов
+async def chat_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'chat'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply("Использование: /chat <сообщение>\nПример: /chat Всем привет! У нас новая акция!")
+        return
+
+    # Получаем сообщение (все после /chat)
+    chat_message = ' '.join(args[1:])
+
+    if not chat_message.strip():
+        await message.reply("❌ Сообщение не может быть пустым")
+        return
+
+    try:
+        # Получаем всех пользователей из базы данных
+        result = await asyncio.to_thread(async_db._execute_query,
+            "SELECT telegram_id FROM users", (), fetchall=True)
+
+        if not result:
+            await message.reply("❌ Пользователи не найдены")
+            return
+
+        # Счетчики для отчета
+        success_count = 0
+        error_count = 0
+
+        # Отправляем сообщение каждому пользователю
+        for (telegram_id,) in result:
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=f"📢 <b>Сообщение от администрации:</b>\n\n{chat_message}",
+                    parse_mode="HTML"
+                )
+                success_count += 1
+                # Небольшая пауза чтобы не превысить лимиты Telegram
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                print(f"Ошибка отправки сообщения пользователю {telegram_id}: {e}")
+                error_count += 1
+
+        # Отчет об отправке
+        report_text = f"""✅ <b>Сообщение отправлено!</b>
+
+📊 <b>Статистика отправки:</b>
+• ✅ Успешно отправлено: {success_count}
+• ❌ Ошибок: {error_count}
+• 📝 Сообщение: {chat_message[:50]}{'...' if len(chat_message) > 50 else ''}"""
+
+        await message.reply(report_text, parse_mode="HTML")
+
+        # Логируем отправку сообщения
+        await async_log_action(message.from_user.id, "admin_chat", 0, f"Отправлено сообщение: {chat_message}")
+
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при отправке сообщения: {e}")
+
+# Обработчик /fake для админов - фейковый вывод средств
+async def fake_withdraw_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'fake'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply("Использование: /fake @username сумма\nПример: /fake @likkerro 50")
+        return
+
+    username = args[1]
+    try:
+        amount = float(args[2])
+    except ValueError:
+        await message.reply("❌ Неверная сумма")
+        return
+
+    if amount <= 0:
+        await message.reply("❌ Сумма должна быть больше 0")
+        return
+
+    # Убираем @ из username если есть
+    if username.startswith('@'):
+        username = username[1:]
+
+    try:
+        # Получаем пользователя по username
+        user_data = await async_get_user_by_username(username)
+
+        if not user_data:
+            await message.reply(f"❌ Пользователь @{username} не найден")
+            return
+
+        telegram_id = user_data[1]
+        display_username = user_data[2] or f"ID:{telegram_id}"
+
+        # Проверяем, установлена ли VIP группа
+        if not vip_group_id:
+            await message.reply("❌ VIP группа не установлена. Используйте /setvip <ID_группы>")
+            return
+
+        # Формируем сообщение для VIP группы
+        fake_message = f"""💸 Вывод средств
+📱 Пользователь: @{display_username}
+💰 Сумма: {amount}$
+⚡Результат: Успешно
+💲 Вывод: {amount}$"""
+
+        # Отправляем в VIP группу
+        try:
+            await bot.send_message(chat_id=vip_group_id, text=fake_message)
+            await message.reply(f"✅ Фейковый вывод отправлен в VIP группу!\n\n{fake_message}")
+        except Exception as e:
+            await message.reply(f"❌ Ошибка отправки в VIP группу: {e}")
+
+        # Логируем действие
+        await async_log_action(message.from_user.id, "admin_fake_withdraw", 0, f"Фейковый вывод для @{username}: {amount}$")
+
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+# Обработчик /panel для админов
+async def panel_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    panel_text = """🔧 <b>Админ панель</b>
+
+📋 <b>Доступные команды:</b>
+
+<b>💰 Управление балансом:</b>
+• <code>/give @username 10.5</code> - выдать деньги пользователю
+• <code>/set @username 500</code> - установить баланс пользователю
+
+<b>🗄️ Управление базами данных:</b>
+• <code>/set0</code> - очистить ВСЕ базы данных (ОПАСНО!)
+
+<b>💬 Чат:</b>
+• <code>/chat сообщение</code> - отправить сообщение всем пользователям
+
+<b>🎭 Фейковые действия:</b>
+• <code>/fake @username сумма</code> - отправить фейковый вывод в VIP группу
+
+<b>🎮 Управление играми:</b>
+• <code>/panel</code> - открыть админ панель
+
+<b>📊 Статистика:</b>
+• <code>/stats</code> - просмотреть статистику всех пользователей
+• <code>/tasks</code> - просмотреть ежедневные задания
+• <code>/logs</code> - просмотреть логи действий пользователей
+
+<b>👥 Группы:</b>
+• <code>/setgroup 123456789</code> - установить группу для результатов
+• <code>/setvip 123456789</code> - установить VIP группу для выплат
+• <code>/getgroup</code> - посмотреть текущую группу
+• <code>/getvip</code> - посмотреть текущую VIP группу
+
+<b>🎫 Промокоды:</b>
+• <code>/createpromo WELCOME 5.0 100</code> - создать промокод
+• <code>/listpromo</code> - список всех промокодов
+
+<b>💡 Шаблоны команд:</b>
+• Выдача денег: <code>/give @username сумма</code>
+• Установка баланса: <code>/set @username сумма</code>
+• Очистка БД: <code>/set0</code> (с подтверждением)
+• Отправка сообщения: <code>/chat сообщение</code>
+• Фейковый вывод: <code>/fake @username сумма</code>
+• Создание промокода: <code>/createpromo КОД СУММА МАКС_АКТИВАЦИЙ</code>
+• Установка группы: <code>/setgroup ID_ГРУППЫ</code>"""
+
+    await message.reply(panel_text, reply_markup=get_admin_panel(), parse_mode="HTML")
+
+# Обработчик /tasks для админов - просмотр списка заданий
+async def tasks_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    tasks_text = "📋 Список ежедневных заданий:\n\n"
+    for i, task in enumerate(DAILY_TASKS, 1):
+        tasks_text += f"{i}. {task['description']} - Награда: {task['reward']}$\n"
+
+    await message.reply(tasks_text)
+
+# Обработчик /setgroup для админов - установка группы для результатов
+async def setgroup_command(message: types.Message):
+    global results_group_id
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # Получаем ID группы из текста сообщения или из chat.id если это группа
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            group_id = int(args[1])
+            results_group_id = group_id
+            await async_save_setting('results_group_id', str(group_id))
+            print(f"Группа установлена: {group_id}")
+            await message.reply(f"✅ Группа для результатов установлена: {group_id}")
+        except ValueError:
+            await message.reply("❌ Неверный формат ID группы")
+    elif message.chat.type in ['group', 'supergroup']:
+        results_group_id = message.chat.id
+        await async_save_setting('results_group_id', str(message.chat.id))
+        print(f"Группа установлена из чата: {message.chat.id}")
+        await message.reply(f"✅ Группа для результатов установлена: {message.chat.id}")
+    else:
+        await message.reply("❌ Использование: /setgroup <group_id> или отправьте команду в группе")
+
+# Обработчик /setvip для админов - установка VIP группы для выплат
+async def setvip_command(message: types.Message):
+    global vip_group_id
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # Получаем ID группы из текста сообщения или из chat.id если это группа
+    args = message.text.split()
+    if len(args) > 1:
+        try:
+            group_id = int(args[1])
+            vip_group_id = group_id
+            result = await async_save_setting('vip_group_id', str(group_id))
+            print(f"VIP группа установлена: {group_id}, результат сохранения: {result}")
+            await message.reply(f"✅ VIP группа установлена: {group_id}")
+        except ValueError:
+            await message.reply("❌ Неверный формат ID группы")
+    elif message.chat.type in ['group', 'supergroup']:
+        vip_group_id = message.chat.id
+        result = await async_save_setting('vip_group_id', str(message.chat.id))
+        print(f"VIP группа установлена из чата: {message.chat.id}, результат сохранения: {result}")
+        await message.reply(f"✅ VIP группа установлена: {message.chat.id}")
+    else:
+        await message.reply("❌ Использование: /setvip <group_id> или отправьте команду в группе")
+
+# Обработчик /getgroup для админов - проверка текущей группы
+async def getgroup_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if results_group_id:
+        await message.reply(f"📋 Текущая группа для результатов: {results_group_id}")
+    else:
+        await message.reply("❌ Группа для результатов не установлена")
+
+# Обработчик /getvip для админов - проверка текущей VIP группы
+async def getvip_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if vip_group_id:
+        await message.reply(f"💎 Текущая VIP группа: {vip_group_id}")
+    else:
+        await message.reply("❌ VIP группа не установлена")
+
+# Обработчик /getgroups для админов - проверка всех групп
+async def getgroups_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    response = "📋 <b>Текущие настройки групп:</b>\n\n"
+
+    if results_group_id:
+        response += f"📊 Группа результатов: <code>{results_group_id}</code>\n"
+    else:
+        response += "📊 Группа результатов: <i>Не установлена</i>\n"
+
+    if vip_group_id:
+        response += f"💎 VIP группа: <code>{vip_group_id}</code>\n"
+    else:
+        response += "💎 VIP группа: <i>Не установлена</i>\n"
+
+    response += "\n💡 <b>Команды для настройки:</b>\n"
+    response += "• <code>/setgroup <ID></code> - установить группу результатов\n"
+    response += "• <code>/setvip <ID></code> - установить VIP группу\n"
+    response += "• <code>/getgroups</code> - показать текущие настройки"
+
+    await message.reply(response, parse_mode="HTML")
+
+# Обработчик /createpromo для админов - создание промокода
+async def createpromo_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.text.split()
+    if len(args) != 4:
+        await message.reply("Использование: /createpromo <код> <сумма> <макс_активаций>\nПример: /createpromo WELCOME 5.0 100")
+        return
+
+    code = args[1].upper()
+    try:
+        reward_amount = float(args[2])
+        max_activations = int(args[3])
+    except ValueError:
+        await message.reply("❌ Неверный формат суммы или количества активаций")
+        return
+
+    if reward_amount <= 0 or max_activations <= 0:
+        await message.reply("❌ Сумма и количество активаций должны быть больше 0")
+        return
+
+    # Создаем промокод без срока действия
+    promo_id = await async_create_promo_code(code, reward_amount, max_activations, None, message.from_user.id)
+
+    if promo_id:
+        # Отправляем сообщение в чат всем пользователям
+        try:
+            # Получаем всех пользователей из базы данных
+            result = await asyncio.to_thread(async_db._execute_query,
+                "SELECT telegram_id FROM users", (), fetchall=True)
+
+            if result:
+                # Счетчики для отчета
+                success_count = 0
+                error_count = 0
+
+                # Формируем сообщение для пользователей
+                promo_message = f"""🎉 <b>Новый промокод!</b>
+
+🎫 <b>Промокод:</b> <span class="tg-spoiler">{code}</span>
+💰 <b>Сумма:</b> {reward_amount}$
+🔢 <b>Активаций:</b> {max_activations}
+
+<i>Нажмите на промокод чтобы увидеть его!</i>"""
+
+                # Отправляем сообщение каждому пользователю
+                for (telegram_id,) in result:
+                    try:
+                        await bot.send_message(
+                            chat_id=telegram_id,
+                            text=promo_message,
+                            parse_mode="HTML"
+                        )
+                        success_count += 1
+                        # Небольшая пауза чтобы не превысить лимиты Telegram
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        print(f"Ошибка отправки промокода пользователю {telegram_id}: {e}")
+                        error_count += 1
+
+                # Отчет об отправке
+                report_text = f"""✅ <b>Промокод создан и разослан!</b>
+
+📊 <b>Статистика рассылки:</b>
+• ✅ Успешно отправлено: {success_count}
+• ❌ Ошибок: {error_count}
+
+🎫 <b>Промокод:</b> <code>{code}</code>
+💰 <b>Сумма:</b> {reward_amount}$
+🔢 <b>Макс. активаций:</b> {max_activations}"""
+
+                await message.reply(report_text, parse_mode="HTML")
+            else:
+                await message.reply(f"✅ Промокод создан!\n\n🎫 Код: <code>{code}</code>\n💰 Сумма: {reward_amount}$\n🔢 Макс. активаций: {max_activations}", parse_mode="HTML")
+        except Exception as e:
+            print(f"Ошибка рассылки промокода: {e}")
+            await message.reply(f"✅ Промокод создан!\n\n🎫 Код: <code>{code}</code>\n💰 Сумма: {reward_amount}$\n🔢 Макс. активаций: {max_activations}", parse_mode="HTML")
+    else:
+        await message.reply("❌ Ошибка создания промокода")
+
+# Обработчик /listpromo для админов - список промокодов
+async def listpromo_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    promo_codes = await async_get_all_promo_codes()
+
+    if not promo_codes:
+        await message.reply("📋 Промокоды не найдены")
+        return
+
+    promo_text = "📋 <b>Список промокодов:</b>\n\n"
+    for promo in promo_codes:
+        promo_id, code, reward_amount, max_activations, current_activations, expires_at, created_by, created_at = promo
+        status = "✅ Активен" if current_activations < max_activations else "❌ Исчерпан"
+        expires = f" (до {expires_at})" if expires_at else ""
+        promo_text += f"🎫 <code>{code}</code>\n💰 {reward_amount}$ | {current_activations}/{max_activations} | {status}{expires}\n\n"
+
+    await message.reply(promo_text, parse_mode="HTML")
+
+# Обработчик /set0 для админов - очистка всех баз данных
+async def set0_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'set0'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    # Проверяем, есть ли CONFIRM в сообщении
+    if "CONFIRM" in message.text.upper():
+        # Прямое подтверждение через команду
+        try:
+            await clear_all_databases()
+
+            success_text = """✅ <b>БАЗЫ ДАННЫХ УСПЕШНО ОЧИЩЕНЫ!</b>
+
+Все данные были удалены:
+• 👥 Пользователи - удалены
+• 💰 Платежи - удалены
+• 💸 Выводы средств - удалены
+• 🎫 Промокоды - удалены
+• 📋 Логи действий - удалены
+• ⚙️ Настройки - сброшены
+
+База данных готова к использованию с нуля."""
+
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+                await message.reply_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=get_back_button(), parse_mode="HTML")
+            except:
+                await message.reply(success_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+            # Логируем очистку баз данных
+            await async_log_action(message.from_user.id, "admin_database_reset", 0, "Полная очистка всех баз данных")
+
+        except Exception as e:
+            error_text = f"❌ Ошибка при очистке баз данных: {e}"
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await message.reply_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            except:
+                await message.reply(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        return
+
+    # Подтверждение очистки
+    confirm_text = """⚠️ <b>ПОДТВЕРЖДЕНИЕ ОЧИСТКИ БАЗ ДАННЫХ</b>
+
+Вы действительно хотите очистить ВСЕ базы данных?
+
+Это действие:
+• ❌ Удалит всех пользователей
+• ❌ Удалит все платежи
+• ❌ Удалит все выводы средств
+• ❌ Удалит все промокоды
+• ❌ Удалит все логи действий
+• ❌ Сбросит все настройки игр
+
+Это действие НЕЛЬЗЯ ОТМЕНИТЬ!
+
+Для подтверждения отправьте: <code>/set0 CONFIRM</code>"""
+
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ ОЧИСТКУ", callback_data="confirm_set0")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="cancel_set0")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+        await message.reply_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+    except:
+        await message.reply(confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+# Обработчик подтверждения очистки баз данных
+async def confirm_set0_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    try:
+        # Очищаем все таблицы базы данных
+        await clear_all_databases()
+
+        success_text = """✅ <b>БАЗЫ ДАННЫХ УСПЕШНО ОЧИЩЕНЫ!</b>
+
+Все данные были удалены:
+• 👥 Пользователи - удалены
+• 💰 Платежи - удалены
+• 💸 Выводы средств - удалены
+• 🎫 Промокоды - удалены
+• 📋 Логи действий - удалены
+• ⚙️ Настройки - сброшены
+
+База данных готова к использованию с нуля."""
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        # Логируем очистку баз данных
+        await async_log_action(callback_query.from_user.id, "admin_database_reset", 0, "Полная очистка всех баз данных")
+
+        await callback_query.answer("✅ Базы данных очищены!", show_alert=True)
+
+    except Exception as e:
+        error_text = f"❌ Ошибка при очистке баз данных: {e}"
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        await callback_query.answer("❌ Ошибка очистки", show_alert=True)
+
+# Обработчик отмены очистки баз данных
+async def cancel_set0_handler(callback_query: types.CallbackQuery):
+    cancel_text = """❌ <b>ОЧИСТКА ОТМЕНЕНА</b>
+
+Операция очистки баз данных была отменена.
+Все данные сохранены."""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=cancel_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=cancel_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer("✅ Очистка отменена", show_alert=True)
+
+# Функция очистки всех баз данных
+async def clear_all_databases():
+    """Очистка всех таблиц базы данных"""
+    try:
+        print("🔄 Начинаем очистку баз данных...")
+
+        # Очищаем таблицу пользователей
+        print("🗑️ Очищаем таблицу пользователей...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM users", commit=True)
+        print("✅ Пользователи очищены")
+
+        # Очищаем таблицу платежей
+        print("🗑️ Очищаем таблицу платежей...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM payments", commit=True)
+        print("✅ Платежи очищены")
+
+        # Очищаем таблицу выводов
+        print("🗑️ Очищаем таблицу выводов...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM withdrawals", commit=True)
+        print("✅ Выводы очищены")
+
+        # Очищаем таблицу промокодов
+        print("🗑️ Очищаем таблицу промокодов...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM promo_codes", commit=True)
+        print("✅ Промокоды очищены")
+
+        # Очищаем таблицу использованных промокодов
+        print("🗑️ Очищаем таблицу использованных промокодов...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM used_promo_codes", commit=True)
+        print("✅ Использованные промокоды очищены")
+
+        # Очищаем таблицу логов
+        print("🗑️ Очищаем таблицу логов...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM user_logs", commit=True)
+        print("✅ Логи очищены")
+
+        # Очищаем таблицу настроек игр (оставляем настройки по умолчанию)
+        print("🗑️ Очищаем таблицу настроек игр...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM game_settings", commit=True)
+        print("✅ Настройки игр очищены")
+
+        # Очищаем таблицу текстовых настроек
+        print("🗑️ Очищаем таблицу текстовых настроек...")
+        await asyncio.to_thread(async_db._execute_query, "DELETE FROM text_settings", commit=True)
+        print("✅ Текстовые настройки очищены")
+
+        # Переинициализируем настройки по умолчанию
+        print("🔄 Восстанавливаем настройки по умолчанию...")
+        default_settings = [
+            ('duel_win_chance', 25.0),
+            ('dice_win_chance', 30.0),
+            ('basketball_win_chance', 10.0),
+            ('slots_win_chance', 15.0),
+            ('blackjack_win_chance', 40.0),
+            ('duel_multiplier', 1.8),
+            ('dice_multiplier', 5.0),
+            ('basketball_multiplier', 1.5),
+            ('slots_multiplier', 8.0),
+            ('blackjack_multiplier', 2.0)
+        ]
+
+        for key, value in default_settings:
+            await asyncio.to_thread(async_db._execute_query,
+                "INSERT OR IGNORE INTO game_settings (setting_key, setting_value) VALUES (?, ?)",
+                (key, value), commit=True)
+        print("✅ Настройки по умолчанию восстановлены")
+
+        # Проверяем результат очистки
+        users_count = await asyncio.to_thread(async_db._execute_query,
+            "SELECT COUNT(*) FROM users", fetchone=True)
+        payments_count = await asyncio.to_thread(async_db._execute_query,
+            "SELECT COUNT(*) FROM payments", fetchone=True)
+        withdrawals_count = await asyncio.to_thread(async_db._execute_query,
+            "SELECT COUNT(*) FROM withdrawals", fetchone=True)
+
+        print(f"📊 Проверка после очистки:")
+        print(f"   👥 Пользователей: {users_count[0] if users_count else 'ошибка'}")
+        print(f"   💰 Платежей: {payments_count[0] if payments_count else 'ошибка'}")
+        print(f"   💸 Выводов: {withdrawals_count[0] if withdrawals_count else 'ошибка'}")
+
+        # Если данные все еще есть, пробуем принудительную очистку
+        if users_count and users_count[0] > 0:
+            print("⚠️ Данные все еще есть, пробуем принудительную очистку...")
+            await asyncio.to_thread(async_db._execute_query, "DELETE FROM users", commit=True)
+            await asyncio.to_thread(async_db._execute_query, "VACUUM", commit=True)
+
+            # Проверяем еще раз
+            users_count_after = await asyncio.to_thread(async_db._execute_query,
+                "SELECT COUNT(*) FROM users", fetchone=True)
+            print(f"📊 После принудительной очистки: {users_count_after[0] if users_count_after else 'ошибка'} пользователей")
+            print("✅ Принудительная очистка выполнена")
+
+        # Очищаем кэши
+        print("🧹 Очищаем кэши...")
+        global user_balance_cache, user_cache_expiry, user_stats_cache, user_stats_cache_expiry
+        async with balance_cache_lock:
+            user_balance_cache.clear()
+            user_cache_expiry.clear()
+
+        async with stats_cache_lock:
+            user_stats_cache.clear()
+            user_stats_cache_expiry.clear()
+
+        # Очищаем топ кэш
+        async with top_cache_lock:
+            global top_deposited_cache, top_spent_cache, top_referrals_cache, last_cache_update
+            top_deposited_cache.clear()
+            top_spent_cache.clear()
+            top_referrals_cache.clear()
+            last_cache_update = 0
+
+        print("✅ Все кэши очищены")
+        print("🎉 Очистка баз данных завершена успешно!")
+
+    except Exception as e:
+        print(f"❌ Ошибка при очистке баз данных: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
+
+# Обработчик /logs для админов - просмотр логов
+async def logs_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'logs'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    args = message.text.split()
+    limit = 20  # По умолчанию 20 записей
+    username = None
+
+    if len(args) > 1:
+        try:
+            if args[1].startswith('@'):
+                username = args[1][1:]  # Убрать @
+            else:
+                limit = int(args[1])
+        except ValueError:
+            await message.reply("❌ Неверный формат. Используйте: /logs [username|@username] [limit]")
+            return
+
+    if len(args) > 2:
+        try:
+            limit = int(args[2])
+        except ValueError:
+            await message.reply("❌ Неверный limit")
+            return
+
+    logs = await async_get_user_logs_by_username(username, limit)
+
+    if not logs:
+        await message.reply("📋 Логи не найдены")
+        return
+
+    logs_text = "📋 <b>Логи действий пользователей:</b>\n\n"
+    for log in logs:
+        telegram_id, action, amount, reason, created_at = log
+        # Получить username асинхронно
+        user_data = await async_get_user(telegram_id)
+        username_display = user_data[2] if user_data and user_data[2] else f"ID:{telegram_id}"
+        amount_str = f" {amount}$" if amount != 0 else ""
+        logs_text += f"👤 @{username_display}\n⚡ {action}{amount_str}\n💬 {reason}\n🕒 {created_at}\n\n"
+
+    await message.reply(logs_text, parse_mode="HTML")
+# Обработчик главного меню
+async def back_to_main(callback_query: types.CallbackQuery):
+    welcome_text, parse_mode = await get_welcome_text(callback_query.from_user)
+    try:
+        main_menu = await get_main_menu(callback_query.from_user.id)
+        await callback_query.message.edit_text(welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+    except:
+        try:
+            main_menu = await get_main_menu(callback_query.from_user.id)
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=welcome_text, parse_mode=parse_mode)
+            await callback_query.message.edit_media(media=media, reply_markup=main_menu)
+        except:
+            # Если не удается редактировать, отправить новое сообщение с фото
+            main_menu = await get_main_menu(callback_query.from_user.id)
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+    await safe_callback_answer(callback_query)
+
+
+# Функция для получения интерфейса ежедневного бонуса
+async def get_daily_bonus_interface(user_id):
+    """Получение интерфейса ежедневного бонуса с кнопкой забрать"""
+    user_data = await async_get_user(user_id)
+    task = get_daily_task()
+    today = date.today()
+
+    # Получаем актуальные данные
+    last_completed = user_data[11] if user_data and len(user_data) > 11 else None
+
+    if last_completed and last_completed == str(today):
+        # Бонус уже получен сегодня
+        bonus_text = f"""🎁 Ежедневный бонус
+
+✅ Задание на сегодня выполнено!
+
+💰 Награда получена: {task['reward']}$
+
+Завтра новое задание!"""
+
+        keyboard = get_back_button()
+    else:
+        # Проверяем выполнение задания
+        completed = check_daily_task_completion(user_data, task) if user_data else False
+
+        if completed:
+            # Задание выполнено, показываем кнопку "забрать"
+            bonus_text = f"""🎁 Ежедневный бонус
+
+✅ Задание выполнено!
+
+💰 Награда: {task['reward']}$
+
+🏆 {task['description']}
+Награда: {task['reward']}$"""
+
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Забрать", callback_data="claim_bonus")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+            ])
+        else:
+            # Задание не выполнено, показываем прогресс
+            progress = 0
+            if task["type"] == "referrals":
+                # Показываем активных рефералов (тех, кто пополнил баланс на 2$+)
+                active_referrals_count = user_data[12] if user_data and len(user_data) > 12 else 0
+                progress = active_referrals_count
+            elif task["type"] == "spent":
+                progress = user_data[7] if user_data else 0  # total_spent
+            elif task["type"] == "deposited":
+                progress = user_data[6] if user_data else 0  # total_deposited
+            elif task["type"] == "games":
+                progress = user_data[8] if user_data else 0  # games_played
+
+            bonus_text = f"""🎁 Ежедневный бонус
+
+🏆 {task['description']}
+Награда: {task['reward']}$
+
+🔜 Ваш прогресс: {progress}/{task['target']}
+
+💡 Выполните задание, чтобы получить награду!"""
+
+            keyboard = get_back_button()
+
+    return bonus_text, keyboard
+
+# Обработчик кнопки "🎁 Ежедневный бонус"
+async def daily_bonus_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    current_time = time.time()
+
+    # Проверка на бота
+    if user.is_bot:
+        await callback_query.answer("❌ Боты не могут получать бонусы", show_alert=True)
+        return
+
+    # Rate limiting: не чаще чем раз в минуту
+    last_attempt = daily_bonus_attempts.get(user.id, 0)
+    if current_time - last_attempt < DAILY_BONUS_COOLDOWN:
+        remaining = int(DAILY_BONUS_COOLDOWN - (current_time - last_attempt))
+        await callback_query.answer(f"⏳ Подождите {remaining} сек перед следующей попыткой", show_alert=True)
+        return
+
+    daily_bonus_attempts[user.id] = current_time
+
+    # Логируем попытку
+    await async_log_action(user.id, "daily_bonus_attempt", 0, f"Попытка получения ежедневного бонуса")
+
+    try:
+        bonus_text, keyboard = await get_daily_bonus_interface(user.id)
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=bonus_text)
+            await callback_query.message.edit_media(media=media, reply_markup=keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=bonus_text, reply_markup=keyboard)
+
+    except Exception as e:
+        print(f"Ошибка в daily_bonus_handler: {e}")
+        error_text = "❌ Произошла ошибка. Попробуйте позже."
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text)
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button())
+
+    await callback_query.answer()
+
+# Обработчик кнопки "🎁 Забрать" бонус
+async def claim_bonus_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    current_time = time.time()
+
+    # Проверка на бота
+    if user.is_bot:
+        await callback_query.answer("❌ Боты не могут получать бонусы", show_alert=True)
+        return
+
+    # Rate limiting: не чаще чем раз в минуту
+    last_attempt = daily_bonus_attempts.get(user.id, 0)
+    if current_time - last_attempt < DAILY_BONUS_COOLDOWN:
+        remaining = int(DAILY_BONUS_COOLDOWN - (current_time - last_attempt))
+        await callback_query.answer(f"⏳ Подождите {remaining} сек перед следующей попыткой", show_alert=True)
+        return
+
+    daily_bonus_attempts[user.id] = current_time
+
+    # Логируем попытку получения бонуса
+    await async_log_action(user.id, "daily_bonus_claim_attempt", 0, f"Попытка получения ежедневного бонуса через кнопку забрать")
+
+    try:
+        user_data = await async_get_user(user.id)
+        task = get_daily_task()
+        today = date.today()
+
+        # Получаем актуальные данные
+        last_completed = user_data[11] if user_data and len(user_data) > 11 else None
+
+        if last_completed and last_completed == str(today):
+            # Бонус уже получен сегодня
+            await callback_query.answer("✅ Бонус уже получен сегодня!", show_alert=True)
+            return
+
+        # Проверяем выполнение задания
+        completed = check_daily_task_completion(user_data, task) if user_data else False
+
+        if not completed:
+            # Задание не выполнено
+            await callback_query.answer("❌ Задание еще не выполнено!", show_alert=True)
+            return
+
+        # Начисляем награду и обновляем дату выполнения задания
+        await async_update_balance(user.id, task['reward'])
+        await invalidate_balance_cache(user.id)
+
+        # Обновляем дату выполнения задания в базе данных
+        await asyncio.to_thread(async_db._execute_query,
+            "UPDATE users SET last_daily_task_completed = ? WHERE telegram_id = ?",
+            (str(today), user.id), commit=True)
+
+        # Логируем получение бонуса
+        await async_log_action(user.id, "daily_bonus_claimed", task['reward'], f"Выполнено задание: {task['description']}")
+
+        # Показываем сообщение об успешном получении бонуса
+        success_text = f"""🎁 Ежедневный бонус
+
+✅ Бонус получен!
+
+💰 Награда: {task['reward']}$
+
+🏆 {task['description']}
+Награда: {task['reward']}$
+
+🎉 Поздравляем! Бонус зачислен на ваш баланс!"""
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text)
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=get_back_button())
+
+        await callback_query.answer("✅ Бонус успешно получен!", show_alert=True)
+
+    except Exception as e:
+        print(f"Ошибка в claim_bonus_handler: {e}")
+        await callback_query.answer("❌ Произошла ошибка при получении бонуса", show_alert=True)
+
+
+# Обработчик кнопки "👥 Реферальная система"
+async def referral_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    referral_count = user_data[4] if user_data else 0
+    active_referrals_count = user_data[12] if user_data and len(user_data) > 12 else 0
+    referral_balance = round(float(user_data[5]), 2) if user_data and user_data[5] is not None else 0
+
+    referral_text = f"""👥 Реферальная система
+
+    🎯 Приглашенных друзей: {referral_count}
+    ✅ Активных рефералов: {active_referrals_count}
+    💰 Реферальный баланс: {referral_balance}$
+
+    💡 Приглашай друзей и зарабатывай! Получай 0.3$ за первое пополнение баланса каждым твоим рефералом на сумму от 2$!
+
+    🔗 Ваша реферальная ссылка:
+    https://t.me/VanishCasinoBot?start={user.id}"""
+
+    referral_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💸 Вывести реферальные", callback_data="withdraw_referral")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=referral_text)
+        await callback_query.message.edit_media(media=media, reply_markup=referral_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=referral_text, reply_markup=referral_keyboard)
+    await callback_query.answer()
+
+# Обработчик кнопки "👤 Профиль"
+async def profile_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    stats = await get_cached_user_stats(user.id)
+
+    if not stats:
+        await callback_query.answer("❌ Профиль не найден", show_alert=True)
+        return
+
+    # Получаем данные пользователя для количества активных рефералов
+    user_data = await async_get_user(user.id)
+
+    # Получаем задание дня
+    task = get_daily_task()
+
+    profile_text = f"""👤 <b>ПРОФИЛЬ</b> 👤
+
+    🎁 <b>Задание:</b><blockquote> {task['description']} 💰 Награда: {task['reward']}$ ✨ </blockquote>
+
+    👤 <b>ИНФОРМАЦИЯ</b>
+    👨‍💻 <b>Имя пользователя:</b> @{stats['username']} ⭐
+    📅 Регистрация: {stats['created_at']}
+
+    💰 <b>БАЛАНС</b>
+    <blockquote>💵 Основной: <code>{stats['balance']}$</code> 💎 </blockquote>
+    <blockquote>💎 Реферальный: <code>{stats['referral_balance']}$</code> 💰 </blockquote>
+
+    📊 <b>СТАТИСТИКА</b>
+    <blockquote>💳 Пополнено: <code>{stats['total_deposited']}$</code> 📈 </blockquote>
+    <blockquote>💸 Потрачено: <code>{stats['total_spent']}$</code> 📉 </blockquote>
+    <blockquote>🎲 Игр сыграно: <code>{stats['games_played']}</code> 🎪 </blockquote>
+    <blockquote>🎯 Винрейт: <code>{stats['win_rate']:.1f}%</code> 🏆 </blockquote>
+
+    👥 <b>РЕФЕРАЛЫ</b>
+    <blockquote>🎯 Друзей: <code>{stats['referral_count']}</code> 👥 </blockquote>
+    <blockquote>✅ Активных: <code>{user_data[12] if user_data and len(user_data) > 12 else 0}</code> 👥 </blockquote>
+    <blockquote>💰 Заработано: <code>{stats['referral_balance']}$</code> 💵 </blockquote>
+
+    <i>Спасибо за игру с нами!</i>"""
+
+    profile_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=profile_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=profile_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=profile_text, reply_markup=profile_keyboard, parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик кнопки "📝 Изменить профиль"
+async def edit_profile_handler(callback_query: types.CallbackQuery):
+    edit_text = """📝 <b>Изменение профиля</b>
+
+Выберите, что хотите изменить:"""
+
+    edit_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Изменить имя", callback_data="change_username")],
+        [InlineKeyboardButton(text="🎨 Изменить аватар", callback_data="change_avatar")],
+        [InlineKeyboardButton(text="🔙 Назад в профиль", callback_data="profile")]
+    ])
+
+    try:
+        await callback_query.message.edit_text(edit_text, reply_markup=edit_keyboard, parse_mode="HTML")
+    except:
+        await callback_query.message.answer(edit_text, reply_markup=edit_keyboard, parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик кнопки "📊 Детальная статистика"
+async def detailed_stats_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+
+    if not user_data:
+        await callback_query.answer("❌ Данные не найдены", show_alert=True)
+        return
+
+    # Получаем детальную статистику
+    games_played = user_data[8] if user_data[8] is not None else 0
+    total_deposited = round(float(user_data[6]), 2) if user_data[6] is not None else 0
+    total_spent = round(float(user_data[7]), 2) if user_data[7] is not None else 0
+
+    # Примерные расчеты (можно доработать)
+    avg_bet = total_spent / max(1, games_played)
+    profit_per_game = (total_deposited - total_spent) / max(1, games_played)
+
+    stats_text = f"""📊 <b>ДЕТАЛЬНАЯ СТАТИСТИКА</b> 📊
+
+┌─ <b>🎮 ИГРОВАЯ СТАТИСТИКА</b> ─┐
+│ 🎲 Всего игр: <code>{games_played}</code>
+│ 💰 Средняя ставка: <code>{avg_bet:.2f}$</code>
+│ 📈 Прибыль на игру: <code>{profit_per_game:.2f}$</code>
+│ 🏆 Лучшая серия побед: <i>В разработке</i>
+└─────────────────────────────┘
+
+┌─ <b>💰 ФИНАНСОВЫЕ ПОКАЗАТЕЛИ</b> ─┐
+│ 💳 Общий депозит: <code>{total_deposited}$</code>
+│ 💸 Общие расходы: <code>{total_spent}$</code>
+│ 📊 ROI: <code>{(total_spent / max(1, total_deposited) * 100):.1f}%</code>
+│ 🎯 Эффективность: <i>Высокая</i>
+└─────────────────────────────┘
+
+💡 <i>Статистика обновляется в реальном времени</i>"""
+
+    stats_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Графики прогресса", callback_data="progress_charts")],
+        [InlineKeyboardButton(text="🔙 Назад в профиль", callback_data="profile")]
+    ])
+
+    try:
+        await callback_query.message.edit_text(stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+    except:
+        await callback_query.message.answer(stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+    await callback_query.answer()
+
+# Заглушки для остальных функций профиля
+async def transaction_history_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer("📜 История транзакций в разработке", show_alert=True)
+
+async def profile_settings_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer("⚙️ Настройки профиля в разработке", show_alert=True)
+
+async def change_username_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer("👤 Изменение имени в разработке", show_alert=True)
+
+async def change_avatar_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer("🎨 Изменение аватара в разработке", show_alert=True)
+
+async def progress_charts_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer("📈 Графики прогресса в разработке", show_alert=True)
+
+# Обработчик кнопки "📊 Рейтинг"
+async def rating_handler(callback_query: types.CallbackQuery):
+    # Получаем топы из кэша
+    top_deposited, top_spent, top_referrals = await get_cached_tops()
+
+    rating_text = "📊 Рейтинг игроков:\n\n"
+
+    rating_text += "💰 Топ пополнивших:\n"
+    for i, (username, amount) in enumerate(top_deposited, 1):
+        username = username or f"User{i}"
+        rating_text += f"{i}. {username} - {amount}$\n"
+
+    rating_text += "\n💸 Топ потративших:\n"
+    for i, (username, amount) in enumerate(top_spent, 1):
+        username = username or f"User{i}"
+        rating_text += f"{i}. {username} - {amount}$\n"
+
+    rating_text += "\n👥 Топ пригласивших:\n"
+    for i, (username, count) in enumerate(top_referrals, 1):
+        username = username or f"User{i}"
+        rating_text += f"{i}. {username} - {count} чел.\n"
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=rating_text)
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=rating_text, reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик кнопки "📈 Шансы"
+async def chances_handler(callback_query: types.CallbackQuery):
+    chances_text = f"""📈 Шансы выигрыша в играх:
+
+🎲 Кости: {DUEL_WIN_CHANCE}% (x{DUEL_MULTIPLIER}) <a href="{DUEL_FAQ_URL}">faq</a>
+🏀 Баскетбол: {BASKETBALL_WIN_CHANCE}% (x{BASKETBALL_MULTIPLIER}) <a href="{BASKETBALL_FAQ_URL}">faq</a>
+🎯 Дартс: 30% (x2.0) <a href="{DARTS_FAQ_URL}">faq</a>
+🎰 Слоты: {SLOTS_WIN_CHANCE}% (x{SLOTS_MULTIPLIER}) <a href="{SLOTS_FAQ_URL}">faq</a>
+🎳 Кубикии: {DICE_WIN_CHANCE}% (x{DICE_MULTIPLIER}) <a href="{DICE_FAQ_URL}">faq</a>
+🃏 BlackJack: {BLACKJACK_WIN_CHANCE}% (x{BLACKJACK_MULTIPLIER}) <a href="{BLACKJACK_FAQ_URL}">faq</a>
+
+💡 Шансы приблизительные и могут меняться.
+🏀 Баскетбол - игра на предсказание результата броска.
+🎰 Слоты - классическая игра с тремя барабанами.
+🃏 BlackJack - классическая игра с дилером."""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=chances_text)
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=chances_text, reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик админ панели шансов
+async def admin_chances_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    chances_text = f"""🔧 Управление шансами выигрыша:
+
+🎲 Кости: {DUEL_WIN_CHANCE}%
+🏀 Баскетбол: {BASKETBALL_WIN_CHANCE}%
+🎰 Слоты: {SLOTS_WIN_CHANCE}%
+🎳 Кубики: {DICE_WIN_CHANCE}%
+🃏 BlackJack: {BLACKJACK_WIN_CHANCE}%
+
+Выберите игру для изменения шансов:"""
+
+    chances_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Кости", callback_data="edit_chance_duel")],
+        [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_chance_basketball")],
+        [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_chance_slots")],
+        [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_chance_dice")],
+        [InlineKeyboardButton(text="🃏 BlackJack", callback_data="edit_chance_blackjack")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=chances_text)
+        await callback_query.message.edit_media(media=media, reply_markup=chances_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=chances_text, reply_markup=chances_keyboard)
+    await callback_query.answer()
+
+# Обработчик редактирования шанса дуэли
+async def edit_chance_duel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_duel_chance)
+    try:
+        await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования шанса Кубикиа
+async def edit_chance_dice_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_dice_chance)
+    try:
+        await callback_query.message.edit_text(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования шанса баскетбола
+async def edit_chance_basketball_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_basketball_chance)
+    try:
+        await callback_query.message.edit_text(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования шанса слотов
+async def edit_chance_slots_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_slots_chance)
+    try:
+        await callback_query.message.edit_text(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования шанса blackjack
+async def edit_chance_blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_blackjack_chance)
+    try:
+        await callback_query.message.edit_text(f"🃏 Введите новый шанс выигрыша для BlackJack (текущий: {BLACKJACK_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🃏 Введите новый шанс выигрыша для BlackJack (текущий: {BLACKJACK_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик ввода нового шанса дуэли
+async def set_duel_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global DUEL_WIN_CHANCE
+        DUEL_WIN_CHANCE = new_chance
+        await async_save_game_setting('duel_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Дуэли изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового шанса Кубикиа
+async def set_dice_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global DICE_WIN_CHANCE
+        DICE_WIN_CHANCE = new_chance
+        await async_save_game_setting('dice_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Кубикие изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового шанса баскетбола
+async def set_basketball_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global BASKETBALL_WIN_CHANCE
+        BASKETBALL_WIN_CHANCE = new_chance
+        await async_save_game_setting('basketball_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Баскетболе изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового шанса слотов
+async def set_slots_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global SLOTS_WIN_CHANCE
+        SLOTS_WIN_CHANCE = new_chance
+        await async_save_game_setting('slots_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Слотах изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового шанса blackjack
+async def set_blackjack_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global BLACKJACK_WIN_CHANCE
+        BLACKJACK_WIN_CHANCE = new_chance
+        await async_save_game_setting('blackjack_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в BlackJack изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик админ панели множителей
+async def admin_multiplier_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    multiplier_text = f"""⚡ Управление множителями выигрыша:
+
+🎲 Кости: x{DUEL_MULTIPLIER}
+🏀 Баскетбол: x{BASKETBALL_MULTIPLIER}
+🎰 Слоты: x{SLOTS_MULTIPLIER}
+🎳 Кубики: x{DICE_MULTIPLIER}
+🃏 BlackJack: x{BLACKJACK_MULTIPLIER}
+
+Выберите игру для изменения множителя:"""
+
+    multiplier_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Кости", callback_data="edit_multiplier_duel")],
+        [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_multiplier_basketball")],
+        [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_multiplier_slots")],
+        [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_multiplier_dice")],
+        [InlineKeyboardButton(text="🃏 BlackJack", callback_data="edit_multiplier_blackjack")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=multiplier_text)
+        await callback_query.message.edit_media(media=media, reply_markup=multiplier_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=multiplier_text, reply_markup=multiplier_keyboard)
+    await callback_query.answer()
+
+# Обработчик возврата в админ панель
+async def admin_panel_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption="🔧 Админ панель")
+    await callback_query.message.edit_media(media=media, reply_markup=get_admin_panel())
+    await callback_query.answer()
+
+# Обработчик кнопки "📊 Статистика"
+async def admin_stats_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем всех пользователей асинхронно
+    users = await async_get_user_stats(limit=50)
+
+    if not users:
+        stats_text = "📊 <b>Статистика пользователей</b>\n\n❌ Пользователей не найдено"
+    else:
+        stats_text = "📊 <b>Статистика пользователей</b>\n\n"
+        for i, (username, balance, referral_count) in enumerate(users, 1):
+            username = username or f"User{i}"
+            balance = round(float(balance), 2) if balance is not None else 0
+            referral_count = referral_count or 0
+            stats_text += f"{i}. @{username} - Баланс: {balance}$ - Рефералы: {referral_count}\n"
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик кнопки "💰 Установить баланс"
+async def admin_set_balance_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    set_text = """💰 <b>Установка баланса</b>
+
+Введите команду в формате:
+/set @username сумма
+
+Пример: /set @testuser 500
+
+Или используйте команду /set напрямую в чате."""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=set_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=set_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик редактирования множителя дуэли
+async def edit_multiplier_duel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_duel_multiplier)
+    try:
+        await callback_query.message.edit_text(f"🎲 Введите новый множитель для Дуэли (текущий: x{DUEL_MULTIPLIER}):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎲 Введите новый множитель для Дуэли (текущий: x{DUEL_MULTIPLIER}):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования множителя Кубикиа
+async def edit_multiplier_dice_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_dice_multiplier)
+    try:
+        await callback_query.message.edit_text(f"🎳 Введите новый множитель для Кубикиа (текущий: x{DICE_MULTIPLIER}):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎳 Введите новый множитель для Кубикиа (текущий: x{DICE_MULTIPLIER}):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования множителя баскетбола
+async def edit_multiplier_basketball_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_basketball_multiplier)
+    try:
+        await callback_query.message.edit_text(f"🏀 Введите новый множитель для Баскетбола (текущий: x{BASKETBALL_MULTIPLIER}):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🏀 Введите новый множитель для Баскетбола (текущий: x{BASKETBALL_MULTIPLIER}):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования множителя слотов
+async def edit_multiplier_slots_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_slots_multiplier)
+    try:
+        await callback_query.message.edit_text(f"🎰 Введите новый множитель для Слотов (текущий: x{SLOTS_MULTIPLIER}):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎰 Введите новый множитель для Слотов (текущий: x{SLOTS_MULTIPLIER}):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик редактирования множителя blackjack
+async def edit_multiplier_blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_blackjack_multiplier)
+    try:
+        await callback_query.message.edit_text(f"🃏 Введите новый множитель для BlackJack (текущий: x{BLACKJACK_MULTIPLIER}):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🃏 Введите новый множитель для BlackJack (текущий: x{BLACKJACK_MULTIPLIER}):", reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик ввода нового множителя дуэли
+async def set_duel_multiplier_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_multiplier = float(message.text.strip())
+        if new_multiplier <= 0:
+            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
+            return
+
+        global DUEL_MULTIPLIER
+        DUEL_MULTIPLIER = new_multiplier
+        await async_save_game_setting('duel_multiplier', new_multiplier)
+        try:
+            await message.answer(f"✅ Множитель выигрыша в Дуэли изменен на x{new_multiplier}", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового множителя Кубикиа
+async def set_dice_multiplier_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_multiplier = float(message.text.strip())
+        if new_multiplier <= 0:
+            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
+            return
+
+        global DICE_MULTIPLIER
+        DICE_MULTIPLIER = new_multiplier
+        await async_save_game_setting('dice_multiplier', new_multiplier)
+        try:
+            await message.answer(f"✅ Множитель выигрыша в Кубикие изменен на x{new_multiplier}", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового множителя баскетбола
+async def set_basketball_multiplier_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_multiplier = float(message.text.strip())
+        if new_multiplier <= 0:
+            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
+            return
+
+        global BASKETBALL_MULTIPLIER
+        BASKETBALL_MULTIPLIER = new_multiplier
+        await async_save_game_setting('basketball_multiplier', new_multiplier)
+        try:
+            await message.answer(f"✅ Множитель выигрыша в Баскетболе изменен на x{new_multiplier}", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового множителя слотов
+async def set_slots_multiplier_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_multiplier = float(message.text.strip())
+        if new_multiplier <= 0:
+            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
+            return
+
+        global SLOTS_MULTIPLIER
+        SLOTS_MULTIPLIER = new_multiplier
+        await async_save_game_setting('slots_multiplier', new_multiplier)
+        try:
+            await message.answer(f"✅ Множитель выигрыша в Слотах изменен на x{new_multiplier}", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик ввода нового множителя blackjack
+async def set_blackjack_multiplier_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_multiplier = float(message.text.strip())
+        if new_multiplier <= 0:
+            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
+            return
+
+        global BLACKJACK_MULTIPLIER
+        BLACKJACK_MULTIPLIER = new_multiplier
+        await async_save_game_setting('blackjack_multiplier', new_multiplier)
+        try:
+            await message.answer(f"✅ Множитель выигрыша в BlackJack изменен на x{new_multiplier}", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+# Обработчик кнопки "🎮 Играть"
+async def play_handler(callback_query: types.CallbackQuery):
+    games_text = "🎮 Выберите игру:"
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=games_text)
+        await callback_query.message.edit_media(media=media, reply_markup=get_games_menu())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=games_text, reply_markup=get_games_menu())
+    await callback_query.answer()
+
+# Обработчик кнопки "Кости"
+async def duel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(DuelStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    duel_text = f"""💎 Баланс: {balance}$
+
+🎲 Кости 
+
+♻️ Множитель: x{DUEL_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=duel_text)
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=duel_text, reply_markup=get_back_button())
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
+# Обработчик кнопки "Кубики"
+async def dice_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(DiceStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    dice_text = f"""💎 Баланс: {balance}$
+
+🎳 Кубики
+
+♻️ Множитель: x{DICE_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=dice_text)
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=dice_text, reply_markup=get_back_button())
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
+
+
+# Обработчик ввода ставки в дуэли
+async def duel_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()  # Очищаем состояние при недостатке средств
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        confirm_text = f"""💎 Баланс: {balance}$
+
+🎲 Кости <a href="{DUEL_FAQ_URL}">faq</a>
+
+♻️ Множитель: x{DUEL_MULTIPLIER}
+
+💰 Ставка: {bet}$"""
+
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Бросить кости", callback_data=f"duel_confirm_{bet}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_duel")]
+        ])
+
+        # Редактируем сообщение с подтверждением ставки
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=confirm_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+# Обработчик кнопки "Баскетбол"
+async def basketball_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(BasketballStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    basketball_text = f"""💎 Баланс: {balance}$
+
+🏀 Баскетбол 
+
+🎯 Угадайте результат броска мяча в кольцо
+♻️ Множитель: x{BASKETBALL_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=basketball_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=basketball_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    # Отправить результат в группу
+    if results_group_id:
+        try:
+            group_text = f"🃏 BlackJack\n👤 {user.first_name or user.username}\n💰 Ставка: {bet}$\nПеребор! -{bet}$"
+            await bot.send_message(chat_id=results_group_id, text=group_text)
+        except:
+            pass
+
+    await callback_query.answer()
+
+# Обработчик ввода ставки в баскетбол
+async def basketball_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()  # Очищаем состояние при недостатке средств
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        confirm_text = f"""💎 Баланс: {balance}$
+
+🏀 Баскетбол <a href="{BASKETBALL_FAQ_URL}">faq</a>
+
+♻️ Множитель: x{BASKETBALL_MULTIPLIER}
+💰 Ставка: {bet}$
+
+🎯 Выберите предсказание:"""
+
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏀 Бросок", callback_data=f"basketball_predict_hit_{bet}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_basketball")]
+        ])
+
+        # Редактируем сообщение с подтверждением ставки
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=confirm_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    except Exception as e:
+        # Общая обработка всех остальных ошибок
+        print(f"Неожиданная ошибка в duel_bet_handler: {e}")
+        try:
+            await message.answer("❌ Произошла ошибка. Попробуйте еще раз.", reply_markup=get_back_button())
+        except:
+            pass
+
+# Обработчик предсказания "Попадет"
+async def basketball_predict_hit_handler(callback_query: types.CallbackQuery):
+    await process_basketball_prediction(callback_query, "hit")
+
+
+# Основная функция обработки предсказания в баскетбол
+async def process_basketball_prediction(callback_query: types.CallbackQuery, prediction: str):
+    data = callback_query.data.split("_")
+    bet = float(data[3])  # bet находится на позиции 3 (basketball_predict_hit_123.45)
+
+    user = callback_query.from_user
+
+    print(f"Начало баскетбола: user={user.id}, bet={bet}, prediction={prediction}")
+
+    # Генерация случайного результата броска (50/50 с rigged логикой)
+    # Rigged логика: шанс выигрыша игрока BASKETBALL_WIN_CHANCE%
+    if BASKETBALL_WIN_CHANCE >= 100:
+        # При 100% шансе всегда попадание
+        actual_result = "hit"
+    elif BASKETBALL_WIN_CHANCE <= 0:
+        # При 0% шансе всегда промах
+        actual_result = "miss"
+    else:
+        # Нормальная rigged логика
+        actual_result = "hit" if random.random() < (BASKETBALL_WIN_CHANCE / 100) else "miss"
+
+    # Определяем, правильно ли предсказал игрок
+    prediction_correct = (prediction == actual_result)
+
+    # Имитация броска с разными исходами
+    if actual_result == "hit":
+        result_emoji = "🎉"
+        result_text = "ГОЛ! Мяч в кольце! 🏀"
+    else:
+        result_emoji = "😞"
+        result_text = "Мимо! Мяч не попал в кольцо 🏀"
+
+    # Увеличиваем счетчик игр
+    await async_update_games_played(user.id)
+
+    # Определение результата игры
+    if prediction_correct:
+        # Выигрыш - предсказание верное
+        winnings = bet * BASKETBALL_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        game_result = f"✅ Вы угадали! +{winnings}$"
+        status_emoji = "🎉"
+    else:
+        # Проигрыш - предсказание неверное
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        game_result = f"❌ Не угадали! -{bet}$"
+        status_emoji = "😞"
+
+    # Показать предсказание игрока
+    prediction_text = "🎯 Попадет"
+
+    print(f"Результат баскетбола: actual_result={actual_result}, prediction_correct={prediction_correct}, game_result={game_result}")
+
+    # Отправить результат в группу
+    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+    if results_group_id:
+        print(f"Отправка результата баскетбола в группу {results_group_id}")
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in game_result:
+                winnings = game_result.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in game_result:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: Баскетбол
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text} {game_result}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат баскетбола отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    # Текст с результатом броска
+    game_text = f"""{result_text}
+
+Вы предсказали: {prediction_text}
+
+{game_result}"""
+
+    # Клавиатура для итогов
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏀 Играть еще", callback_data="game_basketball")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    # Показать результат сразу
+    photo_url = WIN_IMAGE_URL if prediction_correct else LOSE_IMAGE_URL
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=game_text)
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    except:
+        await callback_query.message.answer_photo(photo=photo_url, caption=game_text, reply_markup=result_keyboard)
+
+
+    await callback_query.answer()
+
+# Обработчик кнопки "Слоты"
+async def slots_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SlotsStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    slots_text = f"""💎 Баланс: {balance}$
+
+🎰 Слоты 
+
+♻️ Множитель: x{SLOTS_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=slots_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=slots_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
+# Обработчик кнопки "BlackJack"
+async def blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(BlackjackStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    blackjack_text = f"""💎 Баланс: {balance}$
+
+🃏 BlackJack 
+
+♻️ Множитель: x{BLACKJACK_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=blackjack_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=blackjack_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
+# Обработчик ввода ставки в слоты
+async def slots_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = f"""❌ <b>Недостаточно средств</b>
+
+Ваш баланс: <code>{balance}$</code>
+Запрошенная ставка: <code>{bet}$</code>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        confirm_text = f"""💎 Баланс: {balance}$
+
+🎰 Слоты <a href="{SLOTS_FAQ_URL}">faq</a>
+
+♻️ Множитель: x{SLOTS_MULTIPLIER}
+
+💰 Ставка: {bet}$"""
+
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Крутить", callback_data=f"slots_spin_{bet}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_slots")]
+        ])
+
+        # Редактируем сообщение с подтверждением ставки
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=confirm_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+# Обработчик ввода ставки в blackjack
+async def blackjack_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = f"""❌ <b>Недостаточно средств</b>
+
+Ваш баланс: <code>{balance}$</code>
+Запрошенная ставка: <code>{bet}$</code>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        # Начало игры blackjack
+        # Раздаем карты
+        deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4  # Упрощенная колода
+        random.shuffle(deck)
+
+        player_cards = [deck.pop(), deck.pop()]
+        dealer_cards = [deck.pop(), deck.pop()]
+
+        player_score = sum(player_cards)
+        dealer_score = sum(dealer_cards)
+
+        game_text = f"""💎 Баланс: {balance}$
+
+🃏 BlackJack <a href="{BLACKJACK_FAQ_URL}">faq</a>
+
+♻️ Множитель: x{BLACKJACK_MULTIPLIER}
+💰 Ставка: {bet}$
+
+Ваши карты: {player_cards} (Ваши карты: {player_score})
+Карта дилера: {dealer_cards[0]} (Карты диллера: ?)"""
+
+        game_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🃏 Еще карту", callback_data=f"blackjack_hit_{bet}_{player_cards[0]}_{player_cards[1]}_{dealer_cards[0]}_{dealer_cards[1]}"),
+                InlineKeyboardButton(text="⏹️ Стоп", callback_data=f"blackjack_stand_{bet}_{player_cards[0]}_{player_cards[1]}_{dealer_cards[0]}_{dealer_cards[1]}")
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_blackjack")]
+        ])
+
+        # Редактируем сообщение с игрой
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=game_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=game_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=game_text, reply_markup=game_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
+
+# Обработчик "Еще карту" в blackjack
+async def blackjack_hit_handler(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+    player_cards = [int(x) for x in data[3:-2]]
+    dealer_cards = [int(data[-2]), int(data[-1])]
+
+    user = callback_query.from_user
+
+    print(f"Начало blackjack hit: user={user.id}, bet={bet}, player_cards={player_cards}, dealer_cards={dealer_cards}")
+
+    # Добавляем карту игроку
+    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
+    random.shuffle(deck)
+    # Убираем уже розданные карты
+    for card in player_cards + dealer_cards:
+        if card in deck:
+            deck.remove(card)
+
+    new_card = deck.pop()
+    player_cards.append(new_card)
+    player_score = sum(player_cards)
+
+    # Rigged логика: шанс выигрыша BLACKJACK_WIN_CHANCE%
+    if BLACKJACK_WIN_CHANCE >= 100:
+        # При 100% шансе всегда выигрыш - не даем перебор
+        winnings = bet * BLACKJACK_MULTIPLIER
+        await async_update_games_played(user.id)
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 Вы выиграли! +{winnings}$"
+        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
+            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+        ])
+
+        photo_url = WIN_IMAGE_URL
+        game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
+Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
+
+{result_text}"""
+        media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    elif BLACKJACK_WIN_CHANCE <= 0:
+        # При 0% шансе всегда проигрыш - даем перебор
+        await async_update_games_played(user.id)
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Вы проиграли! -{bet}$"
+        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
+            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+        ])
+
+        photo_url = LOSE_IMAGE_URL
+        game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
+Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
+
+{result_text}"""
+        media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    else:
+        # Нормальная логика игры
+        if player_score > 21:
+            # Перебор
+            await async_update_games_played(user.id)
+            await async_update_balance(user.id, -bet)
+            await invalidate_balance_cache(user.id)
+            result_text = f"Перебор! -{bet}$"
+            result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
+                [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+            ])
+
+            photo_url = LOSE_IMAGE_URL
+            game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
+Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
+
+{result_text}"""
+            media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=result_keyboard
+            )
+
+        print(f"Результат blackjack hit (перебор): player_score={player_score}, result_text={result_text}")
+
+        # Отправить результат в группу
+        print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+        if results_group_id:
+            print(f"Отправка результата blackjack в группу {results_group_id}")
+            try:
+                username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+                if "+" in result_text:
+                    winnings = result_text.split()[-1]
+                    winnings_label = "Выигрыш"
+                elif "-" in result_text:
+                    winnings = f"-{bet}$"
+                    winnings_label = "Проигрыш"
+                else:
+                    winnings = "0$"
+                    winnings_label = "Выигрыш"
+                group_text = f"""📎 Игра: BlackJack
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+                photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+                await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+                print("Результат blackjack отправлен успешно")
+            except Exception as e:
+                print(f"Ошибка отправки в группу: {e}")
+                pass
+        else:
+            print("Группа для результатов не установлена")
+        # Продолжаем игру
+        game_text = f"""Ваши карты: {player_cards} (Очки: {player_score})
+Карта дилера: {dealer_cards[0]} (Очки: ?)"""
+
+        game_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🃏 Еще карту", callback_data=f"blackjack_hit_{bet}_{'_'.join(map(str, player_cards))}_{dealer_cards[0]}_{dealer_cards[1]}"),
+                InlineKeyboardButton(text="⏹️ Стоп", callback_data=f"blackjack_stand_{bet}_{'_'.join(map(str, player_cards))}_{dealer_cards[0]}_{dealer_cards[1]}")
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_blackjack")]
+        ])
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=game_text, parse_mode="HTML")
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=game_keyboard
+        )
+
+    await callback_query.answer()
+
+# Обработчик "Стоп" в blackjack
+async def blackjack_stand_handler(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+    player_cards = [int(x) for x in data[3:-2]]
+    dealer_cards = [int(data[-2]), int(data[-1])]
+
+    user = callback_query.from_user
+
+    print(f"Начало blackjack stand: user={user.id}, bet={bet}, player_cards={player_cards}, dealer_cards={dealer_cards}")
+
+    # Дилер берет карты до 17
+    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
+    random.shuffle(deck)
+    # Убираем уже розданные карты
+    for card in player_cards + dealer_cards:
+        if card in deck:
+            deck.remove(card)
+
+    dealer_score = sum(dealer_cards)
+    while dealer_score < 17:
+        new_card = deck.pop()
+        dealer_cards.append(new_card)
+        dealer_score = sum(dealer_cards)
+
+    player_score = sum(player_cards)
+
+    await async_update_games_played(user.id)
+
+    # Rigged логика: шанс выигрыша BLACKJACK_WIN_CHANCE%
+    if BLACKJACK_WIN_CHANCE >= 100:
+        # При 100% шансе всегда выигрыш
+        winnings = bet * BLACKJACK_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 Вы выиграли! +{winnings}$"
+    elif BLACKJACK_WIN_CHANCE <= 0:
+        # При 0% шансе всегда проигрыш
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Вы проиграли! -{bet}$"
+    else:
+        # Нормальная логика игры
+        if dealer_score > 21 or player_score > dealer_score:
+            # Выигрыш игрока
+            winnings = bet * BLACKJACK_MULTIPLIER
+            await async_update_balance(user.id, winnings)
+            await invalidate_balance_cache(user.id)
+            result_text = f"🎉 Вы выиграли! +{winnings}$"
+        elif player_score == dealer_score:
+            # Ничья
+            result_text = f"🤝 Ничья! Ставка возвращена"
+        else:
+            # Проигрыш
+            await async_update_balance(user.id, -bet)
+            await invalidate_balance_cache(user.id)
+            result_text = f"😞 Вы проиграли! -{bet}$"
+
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    photo_url = WIN_IMAGE_URL if dealer_score > 21 or player_score > dealer_score else LOSE_IMAGE_URL if player_score < dealer_score else WIN_IMAGE_URL  # Ничья как выигрыш
+    game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
+Карты дилера: {dealer_cards} (Очки: {dealer_score})
+
+{result_text}"""
+    media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
+    await bot.edit_message_media(
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        media=media,
+        reply_markup=result_keyboard
+    )
+
+    print(f"Результат blackjack stand: player_score={player_score}, dealer_score={dealer_score}, result_text={result_text}")
+
+    # Отправить результат в группу
+    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+    if results_group_id:
+        print(f"Отправка результата blackjack в группу {results_group_id}")
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in result_text:
+                winnings = result_text.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in result_text:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: BlackJack
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат blackjack отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    await callback_query.answer()
+
+# Обработчик крутки слотов
+async def slots_spin_handler(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+
+    user = callback_query.from_user
+
+    print(f"Начало слотов: user={user.id}, bet={bet}")
+
+    # Генерация результата слотов
+    # Rigged логика: шанс выигрыша SLOTS_WIN_CHANCE%
+    # Символы для слотов
+    symbols = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
+
+    if SLOTS_WIN_CHANCE >= 100:
+        # При 100% шансе всегда выигрыш
+        winning_symbol = random.choice(symbols)
+        result = [winning_symbol, winning_symbol, winning_symbol]
+    elif SLOTS_WIN_CHANCE <= 0:
+        # При 0% шансе всегда проигрыш
+        result = []
+        for _ in range(3):
+            symbol = random.choice(symbols)
+            # Избегаем трех одинаковых в проигрыше
+            while len(result) == 2 and result[0] == result[1] == symbol:
+                symbol = random.choice(symbols)
+            result.append(symbol)
+    else:
+        # Нормальная rigged логика
+        win_chance = random.random() < (SLOTS_WIN_CHANCE / 100)
+
+        if win_chance:
+            # Выигрыш - все три символа одинаковые
+            winning_symbol = random.choice(symbols)
+            result = [winning_symbol, winning_symbol, winning_symbol]
+        else:
+            # Проигрыш - разные символы
+            result = []
+            for _ in range(3):
+                symbol = random.choice(symbols)
+                # Избегаем трех одинаковых в проигрыше
+                while len(result) == 2 and result[0] == result[1] == symbol:
+                    symbol = random.choice(symbols)
+                result.append(symbol)
+
+    # Увеличиваем счетчик игр
+    await async_update_games_played(user.id)
+
+    # Определение результата
+    if win_chance:
+        # Выигрыш
+        winnings = bet * SLOTS_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 ДЖЕКПОТ! +{winnings}$"
+        status_emoji = "🎰"
+    else:
+        # Проигрыш
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Попробуй еще! -{bet}$"
+        status_emoji = "💸"
+
+    print(f"Результат слотов: win_chance={win_chance}, result={result}, result_text={result_text}")
+
+    # Отправить результат в группу
+    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+    if results_group_id:
+        print(f"Отправка результата слотов в группу {results_group_id}")
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in result_text:
+                winnings = result_text.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in result_text:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: Слоты
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат слотов отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    # Показываем результат мгновенно
+    final_result = f"🎰 | {result[0]} | {result[1]} | {result[2]} |\n\n{result_text}"
+
+    # Клавиатура для итогов
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Крутить еще", callback_data="game_slots")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    # Финальное сообщение
+    photo_url = WIN_IMAGE_URL if win_chance else LOSE_IMAGE_URL
+    final_caption = f"🎰 <b>РЕЗУЛЬТАТ:</b>\n\n{final_result}"
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=final_caption, parse_mode="HTML")
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    except:
+        await callback_query.message.answer_photo(photo=photo_url, caption=final_caption, reply_markup=result_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик ввода ставки в Кубикие
+async def dice_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()  # Очищаем состояние при недостатке средств
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        select_text = f"""💎 Баланс: {balance}$
+
+🎳 Кубики <a href="{DICE_FAQ_URL}">faq</a>
+
+♻️ Множитель: x{DICE_MULTIPLIER}
+
+💰 Ставка: {bet}$
+
+Выберите цвет Кубикиа:"""
+
+        color_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔴 Красный", callback_data=f"dice_color_red_{bet}"),
+                InlineKeyboardButton(text="🟢 Зеленый", callback_data=f"dice_color_green_{bet}"),
+                InlineKeyboardButton(text="🔵 Синий", callback_data=f"dice_color_blue_{bet}")
+            ],
+            [
+                InlineKeyboardButton(text="🟣 Розовый", callback_data=f"dice_color_pink_{bet}"),
+                InlineKeyboardButton(text="⚫ Черный", callback_data=f"dice_color_black_{bet}"),
+                InlineKeyboardButton(text="🟤 Коричневый", callback_data=f"dice_color_brown_{bet}")
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_dice")]
+        ])
+
+        # Редактируем сообщение с выбором цвета Кубикиа
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=select_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=color_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=select_text, reply_markup=color_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
+
+# Обработчик подтверждения дуэли
+async def duel_confirm_handler(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+
+    user = callback_query.from_user
+
+    print(f"Начало дуэли: user={user.id}, bet={bet}")
+
+    # Генерация Кубикиов
+    user_dice = random.randint(1, 6)
+    bot_dice = random.randint(1, 6)
+
+    # Rigged логика: шанс выигрыша DUEL_WIN_CHANCE%
+    win_chance = random.random() < (DUEL_WIN_CHANCE / 100)
+
+    if DUEL_WIN_CHANCE >= 100:
+        # При 100% шансе всегда выигрыш
+        if user_dice <= bot_dice:
+            user_dice = bot_dice + 1
+    elif DUEL_WIN_CHANCE <= 0:
+        # При 0% шансе всегда проигрыш
+        if user_dice >= bot_dice:
+            bot_dice = user_dice + 1
+    elif win_chance:
+        # Гарантировать выигрыш только если изначально проигрыш
+        if user_dice <= bot_dice:
+            user_dice = bot_dice + random.randint(1, 6 - bot_dice) if bot_dice < 6 else 6
+    else:
+        # Гарантировать проигрыш только если изначально выигрыш
+        if user_dice >= bot_dice:
+            bot_dice = user_dice + random.randint(1, 6 - user_dice) if user_dice < 6 else 6
+
+    # Увеличиваем счетчик игр
+    await async_update_games_played(user.id)
+
+    # Определение результата
+    if user_dice > bot_dice:
+        # Выигрыш
+        winnings = bet * DUEL_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 Вы выиграли! +{winnings}$"
+    elif user_dice == bot_dice:
+        # Ничья - ставка возвращена
+        result_text = "🤝 Ничья! Ставка возвращена"
+    else:
+        # Проигрыш
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Вы проиграли! -{bet}$"
+
+    print(f"Результат дуэли: user_dice={user_dice}, bot_dice={bot_dice}, result={result_text}")
+
+    # Отправить результат в группу
+    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+    if results_group_id:
+        print(f"Отправка результата дуэли в группу {results_group_id}")
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in result_text:
+                winnings = result_text.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in result_text:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: Дуэль
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат дуэли отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    # Текст с кубиками
+    game_text = f"""🎲 Ваш кубик: {user_dice}
+🎲 Кубик бота: {bot_dice}
+
+{result_text}"""
+
+    # Клавиатура для итогов
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Играть еще", callback_data="game_duel")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    # Показать результат сразу
+    photo_url = WIN_IMAGE_URL if user_dice > bot_dice else LOSE_IMAGE_URL
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=game_text)
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    except:
+        await callback_query.message.answer_photo(photo=photo_url, caption=game_text, reply_markup=result_keyboard)
+
+    # Отправить результат в группу
+    if results_group_id:
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in game_result:
+                winnings = game_result.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in game_result:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: Баскетбол
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text} {game_result}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат баскетбола отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    await callback_query.answer()
+
+# Обработчик кнопки "💰 Пополнить"
+async def deposit_handler(callback_query: types.CallbackQuery):
+    deposit_text = """💰 <b>Пополнение баланса</b>
+
+ 💎 <i>Введите любую сумму для пополнения</i>
+ ⚡ <b>Мгновенное зачисление средств</b>
+ 🔒 <i>Безопасные платежи через Crypto Bot</i>
+
+ 💰 <b>Минимальная сумма:</b> 1$
+ 💎 <b>Максимальная сумма:</b> 1000$
+
+ <i>Поддерживаемые валюты: USDT, BTC, ETH, TON и другие</i>
+
+ 🚀 <b>Готовы к большим выигрышам?</b>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=deposit_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_deposit_menu())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=deposit_text, reply_markup=get_deposit_menu(), parse_mode="HTML")
+    await safe_callback_answer(callback_query)
+
+# Обработчик быстрых сумм
+async def deposit_amount_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    data = callback_query.data
+    if data == "dep_custom":
+        custom_text = """💰 <b>Введите сумму пополнения</b>
+
+ 💎 <i>Укажите желаемую сумму в долларах</i>
+ ⚡ <b>Средства поступят мгновенно</b>
+ 🚀 <b>Готовы к большим выигрышам?</b>
+
+ <i>Пример: 10, 25.5, 100</i>"""
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=custom_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_deposit_back_button())
+        await state.set_state(DepositStates.waiting_for_amount)
+        return
+    
+    amount = int(data.split("_")[1])
+    await process_deposit(callback_query, amount)
+
+# Обработчик ввода суммы
+async def process_custom_amount(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    print(f"Получено сообщение: {message.text}")
+
+    try:
+        # Очистка текста от символов, кроме цифр и точки
+        clean_text = ''.join(c for c in message.text.strip() if c.isdigit() or c == '.')
+
+        if not clean_text:
+            await message.answer("❌ Введите корректную сумму", reply_markup=get_deposit_back_button())
+            return
+
+        amount = float(clean_text)
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть больше 0", reply_markup=get_deposit_back_button())
+            return
+
+        # Завершаем состояние
+        await state.clear()
+
+        # Создаем фейковый callback_query для совместимости
+        class FakeCallback:
+            def __init__(self, message):
+                self.message = message
+                self.from_user = message.from_user
+
+        fake_callback = FakeCallback(message)
+        try:
+            await process_deposit(fake_callback, amount)
+        except Exception as e:
+            print(f"Ошибка создания платежа: {e}")
+            import traceback
+            traceback.print_exc()
+            # Показываем ошибку пользователю вместо ложного успеха
+            error_text = f"""❌ <b>Ошибка создания платежа</b>
+
+Не удалось создать платеж на {amount}$.
+Попробуйте еще раз или обратитесь в поддержку.
+
+<b>Детали ошибки:</b> {str(e)}"""
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    except ValueError as e:
+        print(f"Ошибка парсинга: {e}")
+        await message.answer("❌ Введите корректную сумму (например: 5, 5.5, 5$)", reply_markup=get_deposit_back_button())
+
+# Процесс создания платежа с поддержкой API 1.5.1
+async def process_deposit(callback_query, amount, asset=DEFAULT_ASSET):
+    user_telegram_id = callback_query.from_user.id
+    user_db = await async_get_user(user_telegram_id)
+
+    if not user_db:
+        try:
+            if hasattr(callback_query, 'message') and callback_query.message:
+                await callback_query.message.answer("❌ Ошибка: пользователь не найден", reply_markup=get_back_button())
+            else:
+                await callback_query.message.answer("❌ Ошибка: пользователь не найден", reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer("❌ Ошибка: пользователь не найден", reply_markup=get_back_button())
+        return
+
+    user_id = user_db[0]
+
+    # Валидация суммы
+    if amount < MIN_DEPOSIT or amount > MAX_DEPOSIT:
+        error_text = f"""❌ <b>Неверная сумма</b>
+
+Сумма должна быть от {MIN_DEPOSIT}$ до {MAX_DEPOSIT}$"""
+        try:
+            if hasattr(callback_query, 'message') and callback_query.message:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+            else:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        return
+
+    # Создаем инвойс через Crypto Bot с новыми возможностями API 1.5.1
+    invoice = crypto_bot.create_invoice(
+        amount=amount,
+        description=f"Пополнение баланса {CASINO_NAME} на {amount}$",
+        currency_type=DEFAULT_CURRENCY_TYPE,
+        fiat=DEFAULT_FIAT,
+        accepted_assets=SUPPORTED_ASSETS,
+        expires_in=INVOICE_EXPIRES_IN
+    )
+
+    if not invoice or not invoice.get('result'):
+        error_text = "❌ Ошибка создания платежа. Попробуйте позже."
+        try:
+            if hasattr(callback_query, 'message') and callback_query.message:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text)
+                await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+            else:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_back_button())
+        return
+
+    invoice_data = invoice['result']
+    invoice_id = invoice_data['invoice_id']
+    pay_url = invoice_data.get('pay_url') or invoice_data.get('bot_invoice_url')  # Поддержка нового поля
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    message_id = None
+    chat_id = callback_query.message.chat.id
+    try:
+        if hasattr(callback_query, 'message') and callback_query.message:
+            message_id = callback_query.message.message_id
+    except:
+        pass
+
+    # Сохраняем платеж в БД
+    payment_id = await async_db.create_payment(user_id, amount, invoice_id, message_id, chat_id)
+
+    # Сохраняем ID сообщения платежа в БД для последующего редактирования
+    if message_id:
+        await asyncio.to_thread(async_db._execute_query,
+            "UPDATE payments SET message_id = ?, chat_id = ? WHERE id = ?",
+            (message_id, chat_id, payment_id), commit=True)
+
+    # Отправляем чек пользователю с улучшенным интерфейсом
+    pay_text = f"""💰 <b>Пополнение баланса</b>
+
+ 💎 <b>Сумма:</b> <code>{amount}$</code>
+ 🪙 <b>Валюта:</b> <code>{asset}</code>
+ ⏰ <b>Время на оплату:</b> <code>{INVOICE_EXPIRES_IN//60} минуты</code>
+
+ ⚡ <b>Мгновенное зачисление!</b>
+ 🔒 <b>Безопасная оплата</b>
+ 💎 <b>Поддерживаемые валюты:</b> {', '.join(SUPPORTED_ASSETS)}
+
+ <i>💡 После оплаты средства автоматически поступят на ваш баланс</i>
+
+ 🚀 <b>Готовы к большим выигрышам?</b>"""
+
+    pay_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", url=pay_url)],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="crypto_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="deposit")]
+    ])
+
+    # Проверяем, можем ли мы редактировать сообщение
+    try:
+        if hasattr(callback_query, 'message') and callback_query.message:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=pay_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=pay_keyboard)
+        else:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=pay_text, reply_markup=pay_keyboard, parse_mode="HTML")
+    except:
+        try:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=pay_text, reply_markup=pay_keyboard, parse_mode="HTML")
+        except:
+            if hasattr(callback_query, 'message') and callback_query.message:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=pay_text, reply_markup=pay_keyboard, parse_mode="HTML")
+
+# Проверка оплаты с поддержкой API 1.5.1
+async def check_payment(callback_query: types.CallbackQuery):
+    invoice_id = callback_query.data.split("_")[1]
+
+    # Получаем статус инвойса
+    invoices_data = crypto_bot.get_invoices([invoice_id])
+
+    if not invoices_data or not invoices_data.get('result') or not invoices_data['result'].get('items'):
+        await callback_query.answer("❌ Ошибка проверки платежа", show_alert=True)
+        return
+
+    invoice_item = invoices_data['result']['items'][0]
+    invoice_status = invoice_item['status']
+
+    if invoice_status == 'paid':
+        print(f"Платеж подтвержден: invoice_id={invoice_id}")
+
+        # Получаем платеж из БД по invoice_id асинхронно
+        payment = await async_get_payment_by_invoice(invoice_id)
+
+        if not payment:
+            print(f"Платеж не найден в БД: invoice_id={invoice_id}")
+            await callback_query.answer("❌ Платеж не найден", show_alert=True)
+            return
+
+        user_id, amount, payment_status = payment
+        print(f"Найден платеж: user_id={user_id}, amount={amount}, status={payment_status}")
+
+        # Проверяем, не был ли платеж уже обработан
+        if payment_status == 'paid':
+            print(f"Платеж уже обработан: invoice_id={invoice_id}")
+            await callback_query.answer("✅ Платеж уже подтвержден", show_alert=True)
+            return
+
+        # Получаем telegram_id по user_id асинхронно
+        telegram_id = await async_get_telegram_id_by_user_id(user_id)
+
+        if not telegram_id:
+            print(f"Пользователь не найден: user_id={user_id}")
+            await callback_query.answer("❌ Пользователь не найден", show_alert=True)
+            return
+
+        print(f"Найден telegram_id: {telegram_id}")
+
+        # Проверяем, что пользователь тот же
+        if telegram_id != callback_query.from_user.id:
+            print(f"Несовпадение telegram_id: expected {telegram_id}, got {callback_query.from_user.id}")
+            await callback_query.answer("❌ Это не ваш платеж", show_alert=True)
+            return
+
+        # Получаем детальную информацию о платеже (API 1.5.1)
+        paid_asset = invoice_item.get('paid_asset', DEFAULT_ASSET)
+        paid_amount = float(invoice_item.get('paid_amount', amount))
+        paid_usd_rate = invoice_item.get('paid_usd_rate')
+        fee_amount = invoice_item.get('fee_amount', 0)
+
+        print(f"Детали платежа: asset={paid_asset}, amount={paid_amount}, usd_rate={paid_usd_rate}, fee={fee_amount}")
+
+        # Начисляем средства на баланс через db
+        await async_update_balance(telegram_id, amount)
+        await invalidate_balance_cache(telegram_id)
+
+        # Проверяем, есть ли реферер, и начисляем ему реферальный бонус (0.3$ только за первое пополнение реферала на сумму >= 2$)
+        user_data = await async_get_user(telegram_id)
+        if (user_data and len(user_data) > 9 and user_data[9] and  # referrer_id exists
+            (len(user_data) <= 10 or user_data[10] == 0) and    # referral_bonus_given == 0
+            amount >= REFERRAL_MIN_DEPOSIT):                    # сумма пополнения >= минимальной
+            referrer_id = user_data[9]  # Исправлено: referrer_id находится в user_data[9]
+            referral_bonus = REFERRAL_BONUS
+            await async_update_referral_balance(referrer_id, referral_bonus)
+            # Обновляем счетчик активных рефералов (тех, кто пополнил баланс на 2$+)
+            await async_update_active_referrals_count(referrer_id, amount)
+            # Логируем реферальный бонус
+            await async_log_action(referrer_id, "referral_bonus", referral_bonus, f"Бонус за реферала {telegram_id} пополнившего {amount}$")
+            # Отмечаем, что бонус уже начислен для этого реферала
+            await async_mark_referral_bonus_given(telegram_id)
+            print(f"Реферальный бонус начислен: referrer_id={referrer_id}, bonus={referral_bonus}, deposit_amount={amount}")
+
+        # Обновляем статус платежа в БД
+        await async_update_payment_status(invoice_id, 'paid')
+
+        print(f"Средства начислены: telegram_id={telegram_id}, amount={amount}")
+
+        # Показываем детальную информацию об оплате
+        payment_info = f"""💰 Валюта: <code>{paid_asset}</code>
+💵 Сумма: <code>{paid_amount}</code>
+💎 Курс USD: <code>{paid_usd_rate}</code>
+💸 Комиссия: <code>{fee_amount}</code>""" if paid_usd_rate else f"""💰 Валюта: <code>{paid_asset}</code>
+💵 Сумма: <code>{paid_amount}</code>"""
+
+        success_text = f"""✅ <b>ОПЛАТА УСПЕШНО ПОДТВЕРЖДЕНА!</b>
+
+💰 Сумма: <code>{amount}$</code>
+{payment_info}
+💎 Средства зачислены на ваш баланс
+
+<i>Добро пожаловать в главное меню!</i>"""
+
+        try:
+            # Обновляем сообщение с новым балансом и перенаправляем в меню
+            welcome_text, parse_mode = await get_welcome_text(callback_query.from_user)
+            main_menu = await get_main_menu(callback_query.from_user.id)
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=welcome_text, parse_mode=parse_mode)
+            await callback_query.message.edit_media(media=media, reply_markup=main_menu)
+        except Exception as e:
+            print(f"Ошибка обновления сообщения: {e}")
+            # Если не удалось обновить, отправляем новое сообщение
+            welcome_text, parse_mode = await get_welcome_text(callback_query.from_user)
+            main_menu = await get_main_menu(callback_query.from_user.id)
+            await callback_query.message.answer_photo(
+                photo=BACKGROUND_IMAGE_URL,
+                caption=welcome_text,
+                reply_markup=main_menu,
+                parse_mode=parse_mode
+            )
+
+        await callback_query.answer("✅ Платеж подтвержден! Средства зачислены", show_alert=True)
+
+    else:
+        await callback_query.answer("⏳ Платеж еще не подтвержден", show_alert=True)
+
+# Обработчик статистики Crypto Pay
+async def crypto_stats_handler(callback_query: types.CallbackQuery):
+    """Показать статистику Crypto Pay API"""
+    try:
+        stats = crypto_bot.get_stats()
+
+        if not stats or not stats.get('result'):
+            stats_text = "❌ Не удалось получить статистику"
+        else:
+            stats_data = stats['result']
+            stats_text = f"""📊 <b>Статистика Crypto Pay</b>
+
+💰 Баланс: <code>{stats_data.get('balance', 'N/A')}</code>
+📈 Объем торгов: <code>{stats_data.get('volume', 'N/A')}</code>
+👥 Активных пользователей: <code>{stats_data.get('users_active', 'N/A')}</code>
+
+💡 <i>Данные обновляются в реальном времени</i>"""
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        await callback_query.answer()
+
+    except Exception as e:
+        print(f"Ошибка получения статистики: {e}")
+        await callback_query.answer("❌ Ошибка получения статистики", show_alert=True)
+
+# Обработчик вывода реферальных средств
+async def withdraw_referral_handler(callback_query: types.CallbackQuery):
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    referral_balance = round(float(user_data[5]), 2) if user_data and user_data[5] is not None else 0
+
+    if referral_balance <= 0:
+        await callback_query.answer("❌ Недостаточно реферальных средств", show_alert=True)
+        return
+
+    # Переводим реферальные средства на основной баланс
+    await async_update_balance(user.id, referral_balance)
+    await invalidate_balance_cache(user.id)
+    await async_update_referral_balance(user.id, -referral_balance)
+    # Логируем перевод реферальных средств
+    await async_log_action(user.id, "referral_withdraw", referral_balance, f"Перевод реферальных средств на основной баланс")
+
+    await callback_query.answer(f"✅ Реферальные средства ({referral_balance}$) переведены на основной баланс", show_alert=True)
+
+    # Обновляем сообщение
+    await referral_handler(callback_query)
+
+# Обработчик кнопки "👥 Группы"
+async def groups_handler(callback_query: types.CallbackQuery):
+    groups_text = """👥 <b>Наши группы и каналы</b>
+
+Присоединяйтесь к нашим сообществам для получения актуальной информации, новостей и общения с другими игроками!
+<blockquote>ps: там дают часто промокоды</blockquote>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=groups_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_groups_menu())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=groups_text, reply_markup=get_groups_menu(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик кнопки "🎫 Промокоды"
+async def promo_codes_handler(callback_query: types.CallbackQuery):
+    promo_text = """🎫 <b>Промокоды</b>
+
+Активируйте промокод и получите бонус на баланс!
+
+💡 <i>Промокоды можно получить в наших группах или от администрации</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=promo_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_promo_menu())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=promo_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+    await safe_callback_answer(callback_query)
+
+# Обработчик кнопки "🎫 Активировать промокод"
+async def activate_promo_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    activate_text = """🎫 <b>Активация промокода</b>
+
+Введите код промокода:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=activate_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=activate_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.set_state(PromoStates.waiting_for_promo_code)
+    await state.update_data(message_id=message_id)
+    await callback_query.answer()
+
+# Обработчик кнопки "💸 Вывести"
+async def withdraw_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    if balance <= 0:
+        await callback_query.answer("❌ Недостаточно средств для вывода", show_alert=True)
+        return
+
+    await state.set_state(WithdrawStates.waiting_for_withdraw_amount)
+
+    withdraw_text = f"""💸 <b>Вывод средств</b>
+
+    💰 Ваш баланс: <code>{balance}$</code>
+
+    📝 Введите сумму для вывода в $:
+
+    <i>Минимальная сумма: 1$</i>
+    <i>Обязательно: сыграть хотя бы 1 игру</i>
+    <i>Средства будут отправлены на ваш баланс в @CryptoBot</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=withdraw_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=withdraw_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id)
+    await callback_query.answer()
+
+# Обработчик ввода суммы вывода
+async def withdraw_amount_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            # Получаем ID сообщения для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+
+            error_text = """❌ <b>Ошибка ввода</b>
+
+Сумма должна быть больше 0"""
+
+            if message_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=message.chat.id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        if amount < 1:
+            # Получаем ID сообщения для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+
+            error_text = """❌ <b>Минимальная сумма вывода: 1$</b>
+
+Введите сумму не менее 1$"""
+
+            if message_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=message.chat.id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+    except ValueError:
+        # Получаем ID сообщения для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        return
+
+    # Получаем баланс пользователя
+    user_data = await async_get_user(message.from_user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    # Проверяем, что пользователь сыграл хотя бы 1 игру
+    games_played = user_data[8] if user_data and len(user_data) > 8 and user_data[8] is not None else 0
+    if games_played < 1:
+        # Получаем ID сообщения для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        error_text = """❌ <b>Требование не выполнено</b>
+
+Для вывода средств необходимо сыграть хотя бы 1 игру
+
+<i>Сыграйте в любую игру и попробуйте снова</i>"""
+
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        return
+
+    if amount > balance:
+        # Получаем ID сообщения для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        error_text = f"""❌ <b>Недостаточно средств</b>
+
+Ваш баланс: <code>{balance}$</code>
+Запрошенная сумма: <code>{amount}$</code>
+
+<i>Недостаточно средств для вывода</i>"""
+
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        return
+
+    # Создаем заявку на вывод
+    user_id = user_data[0]
+    withdrawal_id = await async_create_withdrawal(user_id, amount, "crypto_bot_wallet")
+
+    # Проверяем баланс бота перед выводом
+    bot_balance = crypto_bot.get_balance("USDT")
+    if bot_balance and bot_balance.get('result'):
+        # result - это список словарей, находим USDT
+        usdt_balance = None
+        for currency in bot_balance['result']:
+            if currency.get('currency_code') == 'USDT':
+                usdt_balance = currency
+                break
+
+        if usdt_balance:
+            available_balance = float(usdt_balance.get('available', 0))
+            if available_balance < amount:
+                # Недостаточно средств у бота
+                await async_update_withdrawal_status(withdrawal_id, 'failed')
+                error_text = """❌ <b>Ошибка вывода</b>
+
+У бота недостаточно средств для вывода.
+Попробуйте позже или обратитесь в поддержку.
+
+Средства возвращены на ваш баланс."""
+
+                # Получаем ID сообщения для редактирования
+                data = await state.get_data()
+                message_id = data.get('message_id')
+
+                if message_id:
+                    try:
+                        main_menu = await get_main_menu(message.from_user.id)
+                        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                        await bot.edit_message_media(
+                            chat_id=message.chat.id,
+                            message_id=message_id,
+                            media=media,
+                            reply_markup=main_menu
+                        )
+                    except Exception as e:
+                        print(f"Ошибка редактирования сообщения: {e}")
+                        main_menu = await get_main_menu(message.from_user.id)
+                        await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=main_menu, parse_mode="HTML")
+                else:
+                    main_menu = await get_main_menu(message.from_user.id)
+                    await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=main_menu, parse_mode="HTML")
+                return
+        else:
+            # Не найден баланс USDT
+            print("Не найден баланс USDT в ответе API")
+
+    # Списываем средства с баланса
+    await async_update_balance(message.from_user.id, -amount)
+    await invalidate_balance_cache(message.from_user.id)
+
+    print(f"Попытка перевода: user_id={message.from_user.id}, amount={amount}, withdrawal_id={withdrawal_id}")
+
+    # Создаем перевод через Crypto Bot на внутренний баланс пользователя
+    # Используем telegram_id как user_id для Crypto Bot
+    transfer_result = crypto_bot.create_transfer(
+        user_id=message.from_user.id,  # ID пользователя в Telegram как ID в Crypto Bot
+        asset="USDT",
+        amount=amount,  # Без str(), передаем как число
+        spend_id=f"withdraw_{withdrawal_id}",
+        comment=None,  # Убираем комментарий из-за ограничения для новых приложений
+        disable_send_notification=False
+    )
+
+    print(f"Результат перевода: {transfer_result}")
+
+    if transfer_result and isinstance(transfer_result, dict) and transfer_result.get('result'):
+        transfer_data = transfer_result['result']
+        transfer_id = transfer_data.get('transfer_id')
+        await async_update_withdrawal_status(withdrawal_id, 'completed', transfer_id)
+
+        success_text = f"""✅ <b>Вывод успешно выполнен!</b>
+
+💰 Сумма: <code>{amount}$</code>
+🤖 Средства отправлены на ваш баланс в @CryptoBot
+
+📋 ID транзакции: <code>{withdrawal_id}</code>
+
+💡 <b>Средства автоматически отправлены на ваш счет</b>"""
+
+        # Получаем ID сообщения для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        if message_id:
+            try:
+                main_menu = await get_main_menu(message.from_user.id)
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=main_menu
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                main_menu = await get_main_menu(message.from_user.id)
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=main_menu, parse_mode="HTML")
+    else:
+        # Если перевод не удался, возвращаем средства
+        await async_update_balance(message.from_user.id, amount)
+        await invalidate_balance_cache(message.from_user.id)
+        await async_update_withdrawal_status(withdrawal_id, 'failed')
+
+        # Показываем детали ошибки
+        error_details = transfer_result if isinstance(transfer_result, str) else "Неизвестная ошибка"
+
+        # Проверяем тип ошибки
+        if "METHOD_DISABLED" in error_details:
+            solution = """1. Перейдите в @CryptoBot
+2. Зайдите в настройки бота
+3. Включите метод "Transfer" в разделе ограничений
+4. Попробуйте вывести средства снова"""
+        else:
+            solution = """1. Перейдите в @CryptoBot
+2. Создайте кошелек
+3. Попробуйте вывести средства снова"""
+
+        error_text = f"""❌ <b>Ошибка вывода</b>
+
+Не удалось отправить средства.
+<b>Детали ошибки:</b> {error_details}
+
+💡 <b>Решение:</b>
+{solution}
+
+Средства возвращены на ваш баланс."""
+
+        # Получаем ID сообщения для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        if message_id:
+            try:
+                main_menu = await get_main_menu(message.from_user.id)
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=main_menu
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                main_menu = await get_main_menu(message.from_user.id)
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=main_menu, parse_mode="HTML")
+            else:
+                main_menu = await get_main_menu(message.from_user.id)
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=main_menu, parse_mode="HTML")
+
+    # Отправить результат в VIP группу только при успешном выводе
+    print(f"Проверка условия отправки: transfer_result={transfer_result}, type={type(transfer_result)}")
+    if transfer_result and isinstance(transfer_result, dict) and transfer_result.get('result'):
+        print(f"Условие выполнено, проверка VIP группы: vip_group_id = {vip_group_id}, type = {type(vip_group_id)}")
+        if vip_group_id:
+            print(f"Отправка результата вывода в VIP группу {vip_group_id}")
+            try:
+                username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name or "Неизвестно"
+                winnings = f"{amount}$"
+                winnings_label = "Вывод"
+                group_text = f"""💸 Вывод средств
+📱 Пользователь: {username}
+💰 Сумма: {amount}$
+⚡Результат: Успешно
+💲 {winnings_label}: {winnings}"""
+                print(f"Отправка сообщения в группу {vip_group_id} с текстом: {group_text}")
+                result = await bot.send_message(chat_id=vip_group_id, text=group_text)
+                print(f"Результат отправки: {result}")
+                print("Результат вывода отправлен успешно")
+            except Exception as e:
+                print(f"Ошибка отправки в VIP группу: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("VIP группа не установлена")
+    else:
+        print("Условие отправки не выполнено")
+
+    await state.clear()
+
+# Асинхронная функция для обработки платежей в фоне
+async def process_payment_async(telegram_id, amount, invoice_id=None):
+    """Асинхронная обработка платежа для ускорения отклика"""
+    try:
+        # Начисляем средства
+        await async_update_balance(telegram_id, amount)
+        await invalidate_balance_cache(telegram_id)
+
+        # Проверяем реферер
+        user_data = await async_get_user(telegram_id)
+        if (user_data and len(user_data) > 9 and user_data[9] and  # referrer_id exists
+            (len(user_data) <= 10 or user_data[10] == 0) and    # referral_bonus_given == 0
+            amount >= REFERRAL_MIN_DEPOSIT):                    # сумма пополнения >= минимальной
+            referrer_id = user_data[9]  # Исправлено: referrer_id находится в user_data[9]
+            referral_bonus = REFERRAL_BONUS
+            await async_update_referral_balance(referrer_id, referral_bonus)
+            # Отмечаем, что бонус уже начислен для этого реферала
+            await async_mark_referral_bonus_given(telegram_id)
+            print(f"Реферальный бонус начислен асинхронно: referrer_id={referrer_id}, bonus={referral_bonus}, deposit_amount={amount}")
+
+        # Получаем информацию о сообщении платежа
+        message_id = None
+        chat_id = None
+        if invoice_id:
+            payment_data = await async_get_payment_by_invoice(invoice_id)
+            if payment_data:
+                # payment_data теперь содержит: user_id, amount, status, message_id, chat_id
+                message_id = payment_data[3]
+                chat_id = payment_data[4]
+
+        # Редактируем сообщение с платежом, если есть информация
+        if message_id and chat_id:
+            try:
+                success_text = f"""✅ <b>ОПЛАТА УСПЕШНО ПРОШЛА!</b>
+
+💰 <b>Пополнение баланса</b>
+
+💎 Сумма: <code>{amount}$</code>
+💰 Статус: <b>ОПЛАЧЕНО</b> ✅
+
+<i>Средства зачислены на ваш баланс!</i>"""
+
+                success_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📊 Статистика", callback_data="crypto_stats")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+                ])
+
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=success_keyboard
+                )
+                print(f"Сообщение платежа отредактировано: chat_id={chat_id}, message_id={message_id}")
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения платежа: {e}")
+
+        # Отправляем дополнительное уведомление
+        try:
+            notification_text = f"✅ Оплата успешно прошла!\n💰 Баланс пополнен на {amount}$"
+            notification_message = await bot.send_message(chat_id=telegram_id, text=notification_text)
+            print(f"Уведомление об оплате отправлено: telegram_id={telegram_id}, amount={amount}")
+
+            # Создаем задачу для удаления сообщения через 5 секунд
+            asyncio.create_task(delete_notification_after_delay(notification_message.chat.id, notification_message.message_id, 5))
+
+        except Exception as e:
+            print(f"Ошибка отправки уведомления: {e}")
+
+        print(f"Средства начислены асинхронно: telegram_id={telegram_id}, amount={amount}")
+    except Exception as e:
+        print(f"Ошибка асинхронной обработки платежа: {e}")
+
+async def async_mark_referral_bonus_given(telegram_id):
+    """Отметка реферального бонуса как начисленного"""
+    await async_db.mark_referral_bonus_given(telegram_id)
+
+# Проверка pending платежей пользователя
+async def check_pending_payments(telegram_id):
+    pending_payments = await async_get_pending_payments(telegram_id)
+
+    for (invoice_id,) in pending_payments:
+        await check_single_payment(telegram_id, invoice_id)
+
+# Автоматическая проверка всех pending платежей каждые 3 секунды
+async def auto_check_payments():
+    """Автоматическая проверка всех pending платежей каждые 3 секунды"""
+    while True:
+        try:
+            # Получаем pending платежи не старше 3 минут с информацией о пользователях
+            result = await asyncio.to_thread(async_db._execute_query,
+                """
+                SELECT DISTINCT u.telegram_id, p.crypto_bot_invoice_id
+                FROM payments p
+                JOIN users u ON p.user_id = u.id
+                WHERE p.status = 'pending'
+                AND p.created_at >= datetime('now', '-3 minutes')
+                """,
+                (), fetchall=True)
+
+            if result:
+                for telegram_id, invoice_id in result:
+                    await check_single_payment(telegram_id, invoice_id)
+
+        except Exception as e:
+            print(f"Ошибка автоматической проверки платежей: {e}")
+
+        await asyncio.sleep(3)  # Проверяем каждые 3 секунды
+
+# Проверка отдельного платежа
+async def check_single_payment(telegram_id: int, invoice_id: str):
+    """Проверка отдельного платежа"""
+    try:
+        # Проверяем статус инвойса
+        invoices_data = crypto_bot.get_invoices([invoice_id])
+
+        if invoices_data and invoices_data.get('result') and invoices_data['result'].get('items'):
+            invoice_item = invoices_data['result']['items'][0]
+            invoice_status = invoice_item['status']
+
+            if invoice_status == 'paid':
+                # Получаем данные платежа асинхронно
+                amount = await async_get_payment_amount_by_invoice(invoice_id)
+
+                if amount is not None:
+                    # Запускаем асинхронную обработку платежа с invoice_id
+                    asyncio.create_task(process_payment_async(telegram_id, amount, invoice_id))
+                    await async_update_payment_status(invoice_id, 'paid')
+                    print(f"Платеж отправлен на асинхронную обработку: telegram_id={telegram_id}, amount={amount}, invoice_id={invoice_id}")
+
+    except Exception as e:
+        print(f"Ошибка проверки платежа {invoice_id}: {e}")
+
+# Заглушка для остальных кнопок
+async def other_callbacks(callback_query: types.CallbackQuery):
+    await callback_query.answer("🔧 Функция в разработке", show_alert=True)
+
+
+# Обработчик выбора цвета Кубикиа
+async def dice_color_handler(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_")
+    color = data[2]
+    bet = float(data[3])
+
+    user = callback_query.from_user
+
+    print(f"Начало кубиков: user={user.id}, bet={bet}, color={color}")
+
+    # Цвета и их соответствия
+    color_to_number = {
+        "red": 1,
+        "green": 2,
+        "blue": 3,
+        "pink": 4,
+        "black": 5,
+        "brown": 6
+    }
+    number_to_color = {
+        1: ("🔴 Красный", "red"),
+        2: ("🟢 Зеленый", "green"),
+        3: ("🔵 Синий", "blue"),
+        4: ("🟣 Розовый", "pink"),
+        5: ("⚫ Черный", "black"),
+        6: ("🟤 Коричневый", "brown")
+    }
+
+    chosen_number = color_to_number[color]
+    chosen_color_text = number_to_color[chosen_number][0]
+
+    # Бросок Кубикиа
+    dice_result = random.randint(1, 6)
+
+    # Rigged логика: шанс выигрыша DICE_WIN_CHANCE%
+    win_chance = random.random() < (DICE_WIN_CHANCE / 100)
+
+    if win_chance:
+        # Гарантировать выигрыш
+        dice_result = chosen_number
+    else:
+        # Гарантировать проигрыш
+        if dice_result == chosen_number:
+            dice_result = (chosen_number % 6) + 1
+
+    result_color_text = number_to_color[dice_result][0]
+
+    # Увеличиваем счетчик игр
+    await async_update_games_played(user.id)
+
+    # Определение результата
+    if dice_result == chosen_number:
+        # Выигрыш
+        winnings = bet * DICE_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 Вы выиграли! +{winnings}$"
+    else:
+        # Проигрыш
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Вы проиграли! -{bet}$"
+
+    print(f"Результат кубиков: chosen_number={chosen_number}, dice_result={dice_result}, result_text={result_text}")
+
+    # Отправить результат в группу
+    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
+    if results_group_id:
+        print(f"Отправка результата кубиков в группу {results_group_id}")
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if "+" in result_text:
+                winnings = result_text.split()[-1]
+                winnings_label = "Выигрыш"
+            elif "-" in result_text:
+                winnings = f"-{bet}$"
+                winnings_label = "Проигрыш"
+            else:
+                winnings = "0$"
+                winnings_label = "Выигрыш"
+            group_text = f"""📎 Игра: Кубики
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            print("Результат кубиков отправлен успешно")
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+            pass
+    else:
+        print("Группа для результатов не установлена")
+
+    # Текст с Кубикиом
+    game_text = f"""🎲 Верный Кубики: {result_color_text}
+♻️ Вы выбрали: {chosen_color_text}
+
+{result_text}"""
+
+    # Клавиатура для итогов
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Играть еще", callback_data="game_dice")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    # Показать результат сразу
+    photo_url = WIN_IMAGE_URL if dice_result == chosen_number else LOSE_IMAGE_URL
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=game_text)
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    except:
+        await callback_query.message.answer_photo(photo=photo_url, caption=game_text, reply_markup=result_keyboard)
+
+    await callback_query.answer()
+
+# Обработчик ввода кода промокода
+async def promo_code_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    promo_code = message.text.strip().upper()
+
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    # Получаем ID сообщения для редактирования
+    data = await state.get_data()
+    message_id = data.get('message_id')
+
+    # Проверяем промокод
+    promo_data = await async_get_promo_code(promo_code)
+
+    if not promo_data:
+        error_text = """❌ <b>Промокод не найден</b>
+
+Проверьте правильность написания кода и попробуйте еще раз."""
+
+        # Всегда редактируем существующее сообщение
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_promo_menu()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Если редактирование не удалось, отправляем новое сообщение
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+
+        await state.clear()
+        return
+
+    promo_id, code, reward_amount, max_activations, current_activations, expires_at, created_by, created_at = promo_data
+
+    # Активируем промокод
+    success, amount_or_error = await async_activate_promo_code(promo_id, message.from_user.id)
+
+    if success:
+        # Начисляем бонус
+        await async_update_balance(message.from_user.id, amount_or_error)
+        await invalidate_balance_cache(message.from_user.id)
+        # Логируем активацию промокода
+        await async_log_action(message.from_user.id, "promo_activation", amount_or_error, f"Активация промокода {promo_code}")
+
+        success_text = f"""🎫 <b>Вы успешно активировали промокод!</b>
+
+💰 Вы получили: <code>{amount_or_error}$</code>
+
+🎯 Баланс обновлен автоматически."""
+
+        # Всегда редактируем существующее сообщение
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_promo_menu()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Если редактирование не удалось, отправляем новое сообщение
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+    else:
+        error_text = f"""❌ <b>Ошибка активации</b>
+
+{amount_or_error}
+
+Попробуйте другой промокод или обратитесь в поддержку."""
+
+        # Всегда редактируем существующее сообщение
+        if message_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_promo_menu()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Если редактирование не удалось, отправляем новое сообщение
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=get_promo_menu(), parse_mode="HTML")
+
+    await state.clear()
+
+# Заглушка для игр в разработке
+async def game_placeholder_handler(callback_query: types.CallbackQuery):
+    game = callback_query.data.split("_")[1]
+    game_names = {
+        "dice": "Кубики",
+        "darts": "Дартс"
+    }
+    game_name = game_names.get(game, game.capitalize())
+    await callback_query.answer(f"🎮 {game_name} в разработке", show_alert=True)
+
+# Регистрация обработчиков
+def setup_handlers():
+    if dp:
+        # Команды
+        dp.message.register(start_command, F.text.in_(['/start', '/restart']))
+        dp.message.register(give_command, F.text.startswith('/give'))
+        dp.message.register(panel_command, F.text == '/panel')
+        dp.message.register(tasks_command, F.text == '/tasks')
+        dp.message.register(setgroup_command, F.text.startswith('/setgroup'))
+        dp.message.register(setvip_command, F.text.startswith('/setvip'))
+        dp.message.register(getgroup_command, F.text == '/getgroup')
+        dp.message.register(getvip_command, F.text == '/getvip')
+        dp.message.register(getgroups_command, F.text == '/getgroups')
+        dp.message.register(createpromo_command, F.text.startswith('/createpromo'))
+        dp.message.register(listpromo_command, F.text == '/listpromo')
+        dp.message.register(logs_command, F.text == '/logs')
+        dp.message.register(stats_command, F.text == '/stats')
+        dp.message.register(set0_command, F.text == '/set0')
+        dp.message.register(set_command, F.text.startswith('/set'))
+        dp.message.register(chat_command, F.text.startswith('/chat'))
+        dp.message.register(fake_withdraw_command, F.text.startswith('/fake'))
+
+        # Callback кнопок
+        dp.callback_query.register(back_to_main, F.data == "back_to_main")
+        dp.callback_query.register(daily_bonus_handler, F.data == "daily_bonus")
+        dp.callback_query.register(claim_bonus_handler, F.data == "claim_bonus")
+        dp.callback_query.register(profile_handler, F.data == "profile")
+        dp.callback_query.register(play_handler, F.data == "play")
+        dp.callback_query.register(referral_handler, F.data == "referral")
+        dp.callback_query.register(rating_handler, F.data == "rating")
+        dp.callback_query.register(chances_handler, F.data == "chances")
+        dp.callback_query.register(admin_panel_handler, F.data == "admin_panel")
+        dp.callback_query.register(admin_chances_handler, F.data == "admin_chances")
+        dp.callback_query.register(admin_multiplier_handler, F.data == "admin_multiplier")
+        dp.callback_query.register(admin_stats_handler, F.data == "admin_stats")
+        dp.callback_query.register(admin_set_balance_handler, F.data == "admin_set_balance")
+        dp.callback_query.register(edit_chance_duel_handler, F.data == "edit_chance_duel")
+        dp.callback_query.register(edit_chance_dice_handler, F.data == "edit_chance_dice")
+        dp.callback_query.register(edit_chance_basketball_handler, F.data == "edit_chance_basketball")
+        dp.callback_query.register(edit_chance_slots_handler, F.data == "edit_chance_slots")
+        dp.callback_query.register(edit_chance_blackjack_handler, F.data == "edit_chance_blackjack")
+        dp.callback_query.register(edit_multiplier_duel_handler, F.data == "edit_multiplier_duel")
+        dp.callback_query.register(edit_multiplier_basketball_handler, F.data == "edit_multiplier_basketball")
+        dp.callback_query.register(edit_multiplier_slots_handler, F.data == "edit_multiplier_slots")
+        dp.callback_query.register(edit_multiplier_dice_handler, F.data == "edit_multiplier_dice")
+        dp.callback_query.register(edit_multiplier_blackjack_handler, F.data == "edit_multiplier_blackjack")
+        dp.callback_query.register(duel_handler, F.data == "game_duel")
+        dp.callback_query.register(dice_handler, F.data == "game_dice")
+        dp.callback_query.register(dice_color_handler, F.data.startswith("dice_color_"))
+        dp.callback_query.register(basketball_handler, F.data == "game_basketball")
+        dp.callback_query.register(basketball_predict_hit_handler, F.data.startswith("basketball_predict_hit_"))
+        dp.callback_query.register(slots_handler, F.data == "game_slots")
+        dp.callback_query.register(blackjack_handler, F.data == "game_blackjack")
+        dp.callback_query.register(slots_spin_handler, F.data.startswith("slots_spin_"))
+        dp.callback_query.register(blackjack_hit_handler, F.data.startswith("blackjack_hit_"))
+        dp.callback_query.register(blackjack_stand_handler, F.data.startswith("blackjack_stand_"))
+        dp.callback_query.register(game_placeholder_handler, F.data.startswith("game_") & ~F.data.in_(["game_duel", "game_dice", "game_slots", "game_basketball", "game_blackjack"]))
+        dp.callback_query.register(duel_confirm_handler, F.data.startswith("duel_confirm_"))
+        dp.callback_query.register(withdraw_referral_handler, F.data == "withdraw_referral")
+        dp.callback_query.register(deposit_handler, F.data == "deposit")
+        dp.callback_query.register(deposit_amount_handler, F.data.startswith("dep_"))
+        dp.callback_query.register(crypto_stats_handler, F.data == "crypto_stats")
+        dp.callback_query.register(withdraw_handler, F.data == "withdraw")
+        dp.callback_query.register(groups_handler, F.data == "groups")
+        dp.callback_query.register(promo_codes_handler, F.data == "promo_codes")
+        dp.callback_query.register(activate_promo_handler, F.data == "activate_promo")
+        dp.callback_query.register(confirm_set0_handler, F.data == "confirm_set0")
+        dp.callback_query.register(cancel_set0_handler, F.data == "cancel_set0")
+
+        # Обработчики профиля
+        dp.callback_query.register(edit_profile_handler, F.data == "edit_profile")
+        dp.callback_query.register(detailed_stats_handler, F.data == "detailed_stats")
+        dp.callback_query.register(transaction_history_handler, F.data == "transaction_history")
+        dp.callback_query.register(profile_settings_handler, F.data == "profile_settings")
+        dp.callback_query.register(change_username_handler, F.data == "change_username")
+        dp.callback_query.register(change_avatar_handler, F.data == "change_avatar")
+        dp.callback_query.register(progress_charts_handler, F.data == "progress_charts")
+
+        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_chance_blackjack", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "edit_multiplier_blackjack", "game_duel", "game_dice", "game_basketball", "game_slots", "game_blackjack", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts"]))
+
+        # Обработчик ввода суммы
+        dp.message.register(process_custom_amount, DepositStates.waiting_for_amount)
+
+        # Обработчик ввода ставки в дуэли
+        dp.message.register(duel_bet_handler, DuelStates.waiting_for_bet)
+
+        # Обработчик ввода ставки в баскетбол
+        dp.message.register(basketball_bet_handler, BasketballStates.waiting_for_bet)
+
+        # Обработчик ввода ставки в слоты
+        dp.message.register(slots_bet_handler, SlotsStates.waiting_for_bet)
+
+        # Обработчик ввода ставки в blackjack
+        dp.message.register(blackjack_bet_handler, BlackjackStates.waiting_for_bet)
+
+        # Обработчик ввода ставки в Кубикие
+        dp.message.register(dice_bet_handler, DiceStates.waiting_for_bet)
+
+        # Обработчики ввода шансов для админов
+        dp.message.register(set_duel_chance_handler, AdminStates.waiting_for_duel_chance)
+        dp.message.register(set_basketball_chance_handler, AdminStates.waiting_for_basketball_chance)
+        dp.message.register(set_slots_chance_handler, AdminStates.waiting_for_slots_chance)
+        dp.message.register(set_blackjack_chance_handler, AdminStates.waiting_for_blackjack_chance)
+        dp.message.register(set_dice_chance_handler, AdminStates.waiting_for_dice_chance)
+
+        # Обработчики ввода множителей для админов
+        dp.message.register(set_duel_multiplier_handler, AdminStates.waiting_for_duel_multiplier)
+        dp.message.register(set_basketball_multiplier_handler, AdminStates.waiting_for_basketball_multiplier)
+        dp.message.register(set_slots_multiplier_handler, AdminStates.waiting_for_slots_multiplier)
+        dp.message.register(set_blackjack_multiplier_handler, AdminStates.waiting_for_blackjack_multiplier)
+        dp.message.register(set_dice_multiplier_handler, AdminStates.waiting_for_dice_multiplier)
+
+        # Обработчики вывода средств
+        dp.message.register(withdraw_amount_handler, WithdrawStates.waiting_for_withdraw_amount)
+
+        # Обработчики промокодов
+        dp.message.register(promo_code_handler, PromoStates.waiting_for_promo_code)
+
+# Вызываем регистрацию обработчиков
+setup_handlers()
