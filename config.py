@@ -63,15 +63,15 @@ DAILY_TASKS = [
 # Настройки игр по умолчанию
 DEFAULT_GAME_SETTINGS = {
     # Шансы выигрыша (в процентах)
-    'duel_win_chance': 25.0,
-    'dice_win_chance': 30.0,
+    'duel_win_chance': 7.0,
+    'dice_win_chance': 5.0,
     'basketball_win_chance': 10.0,
-    'slots_win_chance': 15.0,
-    'blackjack_win_chance': 40.0,
+    'slots_win_chance': 4.0,
+    'blackjack_win_chance': 3.0,
 
     # Множители выигрыша
     'duel_multiplier': 1.8,
-    'dice_multiplier': 5.0,
+    'dice_multiplier': 3.0,
     'basketball_multiplier': 1.5,
     'slots_multiplier': 8.0,
     'blackjack_multiplier': 2.0,

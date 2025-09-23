@@ -545,11 +545,11 @@ async def load_initial_settings():
 settings = {}
 
 # Шансы выигрыша (в процентах)
-DUEL_WIN_CHANCE = settings.get('duel_win_chance', 25.0)
-DICE_WIN_CHANCE = settings.get('dice_win_chance', 30.0)
+DUEL_WIN_CHANCE = settings.get('duel_win_chance', 7.0)
+DICE_WIN_CHANCE = settings.get('dice_win_chance', 5.0)
 BASKETBALL_WIN_CHANCE = settings.get('basketball_win_chance', 10.0)
-SLOTS_WIN_CHANCE = settings.get('slots_win_chance', 15.0)
-BLACKJACK_WIN_CHANCE = settings.get('blackjack_win_chance', 40.0)
+SLOTS_WIN_CHANCE = settings.get('slots_win_chance', 4.0)
+BLACKJACK_WIN_CHANCE = settings.get('blackjack_win_chance', 3.0)
 
 # Множители выигрыша
 DUEL_MULTIPLIER = settings.get('duel_multiplier', 1.8)
