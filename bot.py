@@ -3455,10 +3455,23 @@ async def blackjack_stand_handler(callback_query: types.CallbackQuery):
             deck.remove(card)
 
     dealer_score = sum(dealer_cards)
-    while dealer_score < 17:
-        new_card = deck.pop()
-        dealer_cards.append(new_card)
-        dealer_score = sum(dealer_cards)
+    # Rigged логика: в 99% случаев дилер набирает ровно 21 очко
+    if random.random() < 0.99:
+        # Дилер набирает карты до 21
+        while dealer_score < 21:
+            if not deck:
+                break  # Если колода закончилась, останавливаемся
+            new_card = deck.pop()
+            dealer_cards.append(new_card)
+            dealer_score = sum(dealer_cards)
+    else:
+        # В 1% случаев используем стандартную логику (до 17)
+        while dealer_score < 17:
+            if not deck:
+                break  # Если колода закончилась, останавливаемся
+            new_card = deck.pop()
+            dealer_cards.append(new_card)
+            dealer_score = sum(dealer_cards)
 
     player_score = sum(player_cards)
 
