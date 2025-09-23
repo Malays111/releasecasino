@@ -531,3 +531,33 @@ class AsyncDatabase:
             "SELECT amount FROM payments WHERE crypto_bot_invoice_id = ?",
             (invoice_id,), fetchone=True)
         return result[0] if result else None
+
+    async def close(self):
+        """Закрытие базы данных и ThreadPoolExecutor"""
+        try:
+            # Принудительно сохраняем все данные в базу
+            await self._force_checkpoint()
+            print("✅ Данные сохранены в базу данных")
+
+            # Закрываем ThreadPoolExecutor
+            if hasattr(self, 'executor') and self.executor:
+                self.executor.shutdown(wait=True)
+                print("✅ ThreadPoolExecutor закрыт")
+        except Exception as e:
+            print(f"⚠️ Ошибка при закрытии базы данных: {e}")
+
+    async def _force_checkpoint(self):
+        """Принудительное сохранение всех данных в базу"""
+        try:
+            # Включаем синхронный режим для гарантированного сохранения
+            await asyncio.to_thread(self._execute_query, "PRAGMA synchronous=FULL;", commit=True)
+
+            # Принудительно сохраняем данные на диск
+            await asyncio.to_thread(self._execute_query, "PRAGMA wal_checkpoint(TRUNCATE);", commit=True)
+
+            # Возвращаем нормальный режим
+            await asyncio.to_thread(self._execute_query, "PRAGMA synchronous=NORMAL;", commit=True)
+
+            print("💾 Контрольная точка WAL выполнена")
+        except Exception as e:
+            print(f"⚠️ Ошибка принудительного сохранения: {e}")

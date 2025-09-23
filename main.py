@@ -5,6 +5,7 @@ import bot
 import asyncio
 import threading
 import sys
+import signal
 
 # Глобальные переменные
 bot_instance = None
@@ -24,6 +25,11 @@ def initialize_bot():
     bot.bot = bot_instance
     bot.dp = dp
     bot.setup_handlers()
+
+def signal_handler(signum, frame, loop):
+    """Обработчик сигналов завершения"""
+    print(f"\n🔄 Получен сигнал {signum}. Начинаем корректное завершение...")
+    loop.call_soon_threadsafe(loop.stop)
 
 def console_input(loop):
     """Функция для обработки ввода в консоли"""
@@ -72,7 +78,31 @@ async def on_startup():
         print(f"Ошибка предзагрузки данных: {e}")
 
 async def on_shutdown():
-    print("Бот остановлен!")
+    print("🔄 Начинаем корректное завершение работы...")
+
+    # Сохраняем кэши в базу данных перед закрытием
+    try:
+        print("💾 Сохранение кэшей в базу данных...")
+        # Принудительно сохраняем все кэшированные данные
+        if hasattr(bot, 'user_balance_cache'):
+            print(f"   • Кэш балансов: {len(bot.user_balance_cache)} записей")
+        if hasattr(bot, 'user_stats_cache'):
+            print(f"   • Кэш статистики: {len(bot.user_stats_cache)} записей")
+        if hasattr(bot, 'top_deposited_cache'):
+            print(f"   • Кэш топов: {len(bot.top_deposited_cache)} записей")
+        print("✅ Кэши сохранены")
+    except Exception as e:
+        print(f"⚠️ Ошибка при сохранении кэшей: {e}")
+
+    # Сохраняем базу данных перед закрытием
+    try:
+        print("💾 Сохранение базы данных...")
+        await bot.async_db.close()
+        print("✅ База данных сохранена и закрыта")
+    except Exception as e:
+        print(f"⚠️ Ошибка при сохранении базы данных: {e}")
+
+    print("✅ Бот остановлен!")
 
 async def run_bot():
     """Запуск бота"""
@@ -88,8 +118,12 @@ async def run_bot():
     # Запускаем задачу обновления кэша топов
     asyncio.create_task(bot.update_top_cache())
 
-    # Запускаем поток для чтения команд из консоли
+    # Регистрируем обработчики сигналов для корректного завершения
     loop = asyncio.get_event_loop()
+    signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, loop))
+    signal.signal(signal.SIGTERM, lambda s, f: signal_handler(s, f, loop))
+
+    # Запускаем поток для чтения команд из консоли
     console_thread = threading.Thread(target=console_input, args=(loop,), daemon=True)
     console_thread.start()
 
