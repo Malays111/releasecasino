@@ -67,15 +67,15 @@ DEFAULT_GAME_SETTINGS = {
     'dice_win_chance': 5.0,
     'basketball_win_chance': 10.0,
     'slots_win_chance': 4.0,
-    'lottery_win_chance': 15.0,   # Шанс выигрыша в лотерее
-    'wheel_win_chance': 25.0,     # Шанс выигрыша в колесе фортуны
+    'lottery_win_chance': 1.0,   # Шанс выигрыша в лотерее
+    'wheel_win_chance': 2.0,     # Шанс выигрыша в колесе фортуны
 
     # Множители выигрыша
     'duel_multiplier': 1.8,
     'dice_multiplier': 3.0,
     'basketball_multiplier': 1.5,
     'slots_multiplier': 8.0,
-    'lottery_multiplier': 10.0,   # x10 для лотереи
+    'lottery_multiplier': 4.0,   # x10 для лотереи
     'wheel_multiplier': 5.0,      # x5 для колеса фортуны
 }
 

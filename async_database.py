@@ -3,6 +3,11 @@ import asyncio
 from typing import Optional, Tuple, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
+async def init_db():
+    """Инициализация базы данных"""
+    db = AsyncDatabase()
+    await db.initialize()
+
 class AsyncDatabase:
     def __init__(self, db_name="casino.db"):
         self.db_name = db_name
@@ -173,6 +178,39 @@ class AsyncDatabase:
                 amount REAL DEFAULT 0,
                 reason TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''', commit=True)
+
+        # Таблица тикетов поддержки
+        await asyncio.to_thread(self._execute_query, '''
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                telegram_id INTEGER,
+                username TEXT,
+                issue TEXT,
+                status TEXT DEFAULT 'open',
+                admin_id INTEGER,
+                admin_username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                closed_at TIMESTAMP,
+                admin_response TEXT,
+                user_cooldown_until TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''', commit=True)
+
+        # Таблица сообщений поддержки
+        await asyncio.to_thread(self._execute_query, '''
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id INTEGER PRIMARY KEY,
+                ticket_id INTEGER,
+                telegram_id INTEGER,
+                message TEXT,
+                is_admin INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ticket_id) REFERENCES support_tickets (id)
             )
         ''', commit=True)
 
@@ -663,3 +701,83 @@ class AsyncDatabase:
             print("💾 Контрольная точка WAL выполнена")
         except Exception as e:
             print(f"⚠️ Ошибка принудительного сохранения: {e}")
+
+    # Функции для работы с тикетами поддержки
+    async def create_support_ticket(self, telegram_id: int, username: str, issue: str) -> int:
+        """Создание нового тикета поддержки"""
+        user = await self.get_user(telegram_id)
+        if not user:
+            return None
+
+        return await asyncio.to_thread(self._execute_query,
+            "INSERT INTO support_tickets (user_id, telegram_id, username, issue, status) VALUES (?, ?, ?, ?, 'open')",
+            (user[0], telegram_id, username, issue), commit=True)
+
+    async def get_support_tickets(self, status: str = None, limit: int = 50) -> List[Tuple]:
+        """Получение тикетов поддержки"""
+        if status:
+            return await asyncio.to_thread(self._execute_query,
+                "SELECT id, user_id, telegram_id, username, issue, status, admin_id, admin_username, created_at, updated_at, closed_at, admin_response FROM support_tickets WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit), fetchall=True)
+        else:
+            return await asyncio.to_thread(self._execute_query,
+                "SELECT id, user_id, telegram_id, username, issue, status, admin_id, admin_username, created_at, updated_at, closed_at, admin_response FROM support_tickets ORDER BY created_at DESC LIMIT ?",
+                (limit,), fetchall=True)
+
+    async def get_user_support_tickets(self, telegram_id: int) -> List[Tuple]:
+        """Получение тикетов пользователя"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, user_id, telegram_id, username, issue, status, admin_id, admin_username, created_at, updated_at, closed_at, admin_response FROM support_tickets WHERE telegram_id = ? ORDER BY created_at DESC",
+            (telegram_id,), fetchall=True)
+
+    async def get_support_ticket(self, ticket_id: int) -> Optional[Tuple]:
+        """Получение конкретного тикета"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, user_id, telegram_id, username, issue, status, admin_id, admin_username, created_at, updated_at, closed_at, admin_response FROM support_tickets WHERE id = ?",
+            (ticket_id,), fetchone=True)
+
+    async def update_ticket_status(self, ticket_id: int, status: str, admin_id: int = None, admin_username: str = None, admin_response: str = None):
+        """Обновление статуса тикета"""
+        if admin_id and admin_username:
+            await asyncio.to_thread(self._execute_query,
+                "UPDATE support_tickets SET status = ?, admin_id = ?, admin_username = ?, admin_response = ?, updated_at = CURRENT_TIMESTAMP, closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, admin_id, admin_username, admin_response, ticket_id), commit=True)
+        else:
+            await asyncio.to_thread(self._execute_query,
+                "UPDATE support_tickets SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, ticket_id), commit=True)
+
+    async def set_user_cooldown(self, telegram_id: int, cooldown_minutes: int):
+        """Установка cooldown для пользователя"""
+        from datetime import datetime, timedelta
+        cooldown_until = datetime.now() + timedelta(minutes=cooldown_minutes)
+        await asyncio.to_thread(self._execute_query,
+            "UPDATE support_tickets SET user_cooldown_until = ? WHERE telegram_id = ? AND status = 'rejected'",
+            (cooldown_until.isoformat(), telegram_id), commit=True)
+
+    async def check_user_cooldown(self, telegram_id: int) -> bool:
+        """Проверка cooldown пользователя"""
+        from datetime import datetime
+        result = await asyncio.to_thread(self._execute_query,
+            "SELECT user_cooldown_until FROM support_tickets WHERE telegram_id = ? AND user_cooldown_until > ? ORDER BY user_cooldown_until DESC LIMIT 1",
+            (telegram_id, datetime.now().isoformat()), fetchone=True)
+        return result is not None
+
+    async def add_support_message(self, ticket_id: int, telegram_id: int, message: str, is_admin: int = 0) -> int:
+        """Добавление сообщения в тикет"""
+        return await asyncio.to_thread(self._execute_query,
+            "INSERT INTO support_messages (ticket_id, telegram_id, message, is_admin) VALUES (?, ?, ?, ?)",
+            (ticket_id, telegram_id, message, is_admin), commit=True)
+
+    async def get_support_messages(self, ticket_id: int) -> List[Tuple]:
+        """Получение сообщений тикета"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, ticket_id, telegram_id, message, is_admin, created_at FROM support_messages WHERE ticket_id = ? ORDER BY created_at ASC",
+            (ticket_id,), fetchall=True)
+
+    async def get_open_tickets_count(self) -> int:
+        """Получение количества открытых тикетов"""
+        result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM support_tickets WHERE status = 'open'",
+            fetchone=True)
+        return result[0] if result else 0

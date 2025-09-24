@@ -3,8 +3,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from config import TELEGRAM_TOKEN
 import bot
 import asyncio
-import threading
-import sys
 import signal
 import os
 import psutil
@@ -71,21 +69,6 @@ def signal_handler(signum, frame, loop):
 
     loop.call_soon_threadsafe(loop.stop)
 
-def console_input(loop):
-    """Функция для обработки ввода в консоли"""
-    while True:
-        try:
-            command = input().strip().lower()
-            if command == 'stop':
-                print("Остановка бота...")
-                loop.call_soon_threadsafe(loop.stop)
-                break
-            elif command == 'restart':
-                print("Перезапуск бота...")
-                loop.call_soon_threadsafe(loop.stop)
-                break
-        except:
-            pass
 
 async def on_startup():
     print("VanishCasino Bot запущен!")
@@ -163,9 +146,6 @@ async def run_bot():
     signal.signal(signal.SIGINT, lambda s, f: signal_handler(s, f, loop))
     signal.signal(signal.SIGTERM, lambda s, f: signal_handler(s, f, loop))
 
-    # Запускаем поток для чтения команд из консоли
-    console_thread = threading.Thread(target=console_input, args=(loop,), daemon=True)
-    console_thread.start()
 
     try:
         # Запускаем бота без пропуска обновлений для более быстрой реакции
@@ -177,29 +157,25 @@ async def run_bot():
 
 async def main():
     """Основная функция с возможностью перезапуска"""
-    while True:
-        await run_bot()
-        
-        # Спрашиваем, хочет ли пользователь перезапустить
-        print("\nБот остановлен. Выберите действие:")
-        print("1. Перезапустить (введите 'r')")
-        print("2. Выйти (введите 'q')")
-        print("3. Или просто введите 'r' или 'q':")
-        
+    restart_count = 0
+    max_restarts = 5
+
+    while restart_count < max_restarts:
         try:
-            choice = input().strip().lower()
-            if choice in ['q', 'quit', 'exit', '2']:
-                print("До свидания!")
-                break
-            elif choice in ['r', 'restart', '1', '']:
-                print("Перезапуск...")
-                continue
+            await run_bot()
+            break  # Если бот завершился нормально, выходим из цикла
+        except Exception as e:
+            restart_count += 1
+            print(f"❌ Ошибка бота (попытка {restart_count}/{max_restarts}): {e}")
+
+            if restart_count < max_restarts:
+                print("🔄 Перезапуск через 5 секунд...")
+                await asyncio.sleep(5)
             else:
-                print("Перезапуск...")
-                continue
-        except (EOFError, KeyboardInterrupt):
-            print("\nДо свидания!")
-            break
+                print("❌ Достигнуто максимальное количество перезапусков")
+                break
+
+    print("✅ Бот остановлен")
 
 if __name__ == '__main__':
     asyncio.run(main())

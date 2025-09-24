@@ -64,6 +64,7 @@ COMMAND_COOLDOWN = 0.0  # Убрана задержка для мгновенн�
 callback_rate_limits = {}
 CALLBACK_COOLDOWN = 0.0  # Убрана задержка для мгновенного отклика
 
+
 async def check_command_rate_limit(user_id, command):
     """Проверка rate limiting для команд"""
     current_time = time.time()
@@ -250,6 +251,7 @@ async def async_update_games_played(telegram_id):
 async def async_update_payment_status(invoice_id, status):
     """Обновление статуса платежа"""
     await async_db.update_payment_status(invoice_id, status)
+
 
 # Функция предварительной загрузки данных
 async def preload_data():
@@ -577,17 +579,18 @@ class DiceStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_for_duel_chance = State()
+    admin_chatting = State()
     waiting_for_dice_chance = State()
     waiting_for_basketball_chance = State()
     waiting_for_slots_chance = State()
-    waiting_for_lottery_chance = State()
     waiting_for_wheel_chance = State()
+    waiting_for_lottery_chance = State()
     waiting_for_duel_multiplier = State()
     waiting_for_dice_multiplier = State()
     waiting_for_basketball_multiplier = State()
     waiting_for_slots_multiplier = State()
-    waiting_for_lottery_multiplier = State()
     waiting_for_wheel_multiplier = State()
+    waiting_for_lottery_multiplier = State()
 
 class WithdrawStates(StatesGroup):
     waiting_for_wallet_address = State()
@@ -610,6 +613,9 @@ class LotteryStates(StatesGroup):
 
 class WheelStates(StatesGroup):
     waiting_for_bet = State()
+
+
+
 
 # Главное меню
 async def get_main_menu(user_id=None):
@@ -658,6 +664,7 @@ async def get_main_menu(user_id=None):
         ])
 
     inline_keyboard.append([InlineKeyboardButton(text="🎫 ПРОМОКОДЫ 🎉", callback_data="promo_codes")])
+    inline_keyboard.append([InlineKeyboardButton(text="🛠️ ПОДДЕРЖКА", callback_data="support")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     return keyboard
@@ -1056,6 +1063,11 @@ async def fake_withdraw_command(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка: {e}")
 
+
+
+
+
+
 # Обработчик /panel для админов
 async def panel_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -1077,6 +1089,7 @@ async def panel_command(message: types.Message):
 
 <b>🎭 Фейковые действия:</b>
 • <code>/fake @username сумма</code> - отправить фейковый вывод в VIP группу
+
 
 <b>🎮 Управление играми:</b>
 • <code>/panel</code> - открыть админ панель
@@ -2177,6 +2190,19 @@ async def edit_chance_slots_handler(callback_query: types.CallbackQuery, state: 
         await callback_query.message.answer(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
     await callback_query.answer()
 
+# Обработчик редактирования шанса колеса фортуны
+async def edit_chance_wheel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_wheel_chance)
+    try:
+        await callback_query.message.edit_text(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+    await callback_query.answer()
+
 # Обработчик редактирования шанса лотереи
 async def edit_chance_lottery_handler(callback_query: types.CallbackQuery, state: FSMContext):
     if callback_query.from_user.id not in ADMIN_IDS:
@@ -2188,19 +2214,6 @@ async def edit_chance_lottery_handler(callback_query: types.CallbackQuery, state
         await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=get_back_button())
     except:
         await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=get_back_button())
-    await callback_query.answer()
-
-# Обработчик редактирования шанса колеса
-async def edit_chance_wheel_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_for_wheel_chance)
-    try:
-        await callback_query.message.edit_text(f"🎡 Введите новый шанс выигрыша для Колеса (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
-    except:
-        await callback_query.message.answer(f"🎡 Введите новый шанс выигрыша для Колеса (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
     await callback_query.answer()
 
 
@@ -2320,6 +2333,35 @@ async def set_slots_chance_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
+# Обработчик ввода нового шанса колеса фортуны
+async def set_wheel_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            return
+
+        global WHEEL_WIN_CHANCE
+        WHEEL_WIN_CHANCE = new_chance
+        await async_save_game_setting('wheel_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Колесе фортуны изменен на {new_chance}%", reply_markup=get_admin_panel())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
 # Обработчик ввода нового шанса лотереи
 async def set_lottery_chance_handler(message: types.Message, state: FSMContext):
     # Удаляем сообщение пользователя
@@ -2349,35 +2391,6 @@ async def set_lottery_chance_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
-# Обработчик ввода нового шанса колеса
-async def set_wheel_chance_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
-
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    try:
-        new_chance = float(message.text.strip())
-        if not 0 <= new_chance <= 100:
-            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
-            return
-
-        global WHEEL_WIN_CHANCE
-        WHEEL_WIN_CHANCE = new_chance
-        await async_save_game_setting('wheel_win_chance', new_chance)
-        try:
-            await message.answer(f"✅ Шанс выигрыша в Колесе изменен на {new_chance}%", reply_markup=get_admin_panel())
-        except:
-            pass
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
-
 
 # Обработчик админ панели множителей
 async def admin_multiplier_handler(callback_query: types.CallbackQuery):
@@ -2399,9 +2412,7 @@ async def admin_multiplier_handler(callback_query: types.CallbackQuery):
         [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_multiplier_basketball")],
         [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_multiplier_slots")],
         [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_multiplier_dice")],
-        [InlineKeyboardButton(text="🎲 Лотерея", callback_data="edit_multiplier_lottery")],
-        [InlineKeyboardButton(text="🎡 Колесо", callback_data="edit_multiplier_wheel")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
     try:
@@ -2562,32 +2573,6 @@ async def edit_multiplier_slots_handler(callback_query: types.CallbackQuery, sta
         await callback_query.message.answer(f"🎰 Введите новый множитель для Слотов (текущий: x{SLOTS_MULTIPLIER}):", reply_markup=get_back_button())
     await callback_query.answer()
 
-# Обработчик редактирования множителя лотереи
-async def edit_multiplier_lottery_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_for_lottery_multiplier)
-    try:
-        await callback_query.message.edit_text(f"🎲 Введите новый множитель для Лотереи (текущий: x{LOTTERY_MULTIPLIER}):", reply_markup=get_back_button())
-    except:
-        await callback_query.message.answer(f"🎲 Введите новый множитель для Лотереи (текущий: x{LOTTERY_MULTIPLIER}):", reply_markup=get_back_button())
-    await callback_query.answer()
-
-# Обработчик редактирования множителя колеса
-async def edit_multiplier_wheel_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_for_wheel_multiplier)
-    try:
-        await callback_query.message.edit_text(f"🎡 Введите новый множитель для Колеса (текущий: x{WHEEL_MULTIPLIER}):", reply_markup=get_back_button())
-    except:
-        await callback_query.message.answer(f"🎡 Введите новый множитель для Колеса (текущий: x{WHEEL_MULTIPLIER}):", reply_markup=get_back_button())
-    await callback_query.answer()
-
 
 # Обработчик ввода нового множителя дуэли
 async def set_duel_multiplier_handler(message: types.Message, state: FSMContext):
@@ -2698,64 +2683,6 @@ async def set_slots_multiplier_handler(message: types.Message, state: FSMContext
         await async_save_game_setting('slots_multiplier', new_multiplier)
         try:
             await message.answer(f"✅ Множитель выигрыша в Слотах изменен на x{new_multiplier}", reply_markup=get_admin_panel())
-        except:
-            pass
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
-
-# Обработчик ввода нового множителя лотереи
-async def set_lottery_multiplier_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
-
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    try:
-        new_multiplier = float(message.text.strip())
-        if new_multiplier <= 0:
-            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
-            return
-
-        global LOTTERY_MULTIPLIER
-        LOTTERY_MULTIPLIER = new_multiplier
-        await async_save_game_setting('lottery_multiplier', new_multiplier)
-        try:
-            await message.answer(f"✅ Множитель выигрыша в Лотерее изменен на x{new_multiplier}", reply_markup=get_admin_panel())
-        except:
-            pass
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
-
-# Обработчик ввода нового множителя колеса
-async def set_wheel_multiplier_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
-
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    try:
-        new_multiplier = float(message.text.strip())
-        if new_multiplier <= 0:
-            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
-            return
-
-        global WHEEL_MULTIPLIER
-        WHEEL_MULTIPLIER = new_multiplier
-        await async_save_game_setting('wheel_multiplier', new_multiplier)
-        try:
-            await message.answer(f"✅ Множитель выигрыша в Колесе изменен на x{new_multiplier}", reply_markup=get_admin_panel())
         except:
             pass
         await state.clear()
@@ -4778,9 +4705,9 @@ async def groups_handler(callback_query: types.CallbackQuery):
 async def promo_codes_handler(callback_query: types.CallbackQuery):
     promo_text = """🎫 <b>Промокоды</b>
 
-Активируйте промокод и получите бонус на баланс!
+    Активируйте промокод и получите бонус на баланс!
 
-💡 <i>Промокоды можно получить в наших группах или от администрации</i>"""
+    💡 <i>Промокоды можно получить в наших группах или от администрации</i>"""
 
     try:
         media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=promo_text, parse_mode="HTML")
@@ -4788,6 +4715,33 @@ async def promo_codes_handler(callback_query: types.CallbackQuery):
     except:
         await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=promo_text, reply_markup=get_promo_menu(), parse_mode="HTML")
     await safe_callback_answer(callback_query)
+
+# Обработчик кнопки "🛠️ Поддержка"
+async def support_handler(callback_query: types.CallbackQuery):
+    support_text = """🛠️ <b>ПОДДЕРЖКА</b> 🛠️
+
+✅ <b>ЧАТ - ОНЛАЙН, ТЕХНИЧЕСКОЙ ПОДДЕРЖКИ !</b>
+
+👨‍💻 <b>Техническая поддержка сразу отвечает на ваши сообщения.</b>
+
+💬 <b>Объясните свою проблему подробнее в этом чате</b>
+
+                           <b>t.me/texvanishcasino</b>
+
+<b>Техническая поддержка сразу же вам ответит! 🚀</b>"""
+
+    support_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Открыть чат поддержки", url="https://t.me/texvanishcasino")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=support_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=support_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=support_text, reply_markup=support_keyboard, parse_mode="HTML")
+    await safe_callback_answer(callback_query)
+
 
 # Обработчик кнопки "🎫 Активировать промокод"
 async def activate_promo_handler(callback_query: types.CallbackQuery, state: FSMContext):
@@ -5914,6 +5868,11 @@ async def promo_code_handler(message: types.Message, state: FSMContext):
 
     await state.clear()
 
+
+
+
+
+
 # Заглушка для игр в разработке
 async def game_placeholder_handler(callback_query: types.CallbackQuery):
     game = callback_query.data.split("_")[1]
@@ -5964,14 +5923,12 @@ def setup_handlers():
         dp.callback_query.register(edit_chance_dice_handler, F.data == "edit_chance_dice")
         dp.callback_query.register(edit_chance_basketball_handler, F.data == "edit_chance_basketball")
         dp.callback_query.register(edit_chance_slots_handler, F.data == "edit_chance_slots")
-        dp.callback_query.register(edit_chance_lottery_handler, F.data == "edit_chance_lottery")
         dp.callback_query.register(edit_chance_wheel_handler, F.data == "edit_chance_wheel")
+        dp.callback_query.register(edit_chance_lottery_handler, F.data == "edit_chance_lottery")
         dp.callback_query.register(edit_multiplier_duel_handler, F.data == "edit_multiplier_duel")
         dp.callback_query.register(edit_multiplier_basketball_handler, F.data == "edit_multiplier_basketball")
         dp.callback_query.register(edit_multiplier_slots_handler, F.data == "edit_multiplier_slots")
         dp.callback_query.register(edit_multiplier_dice_handler, F.data == "edit_multiplier_dice")
-        dp.callback_query.register(edit_multiplier_lottery_handler, F.data == "edit_multiplier_lottery")
-        dp.callback_query.register(edit_multiplier_wheel_handler, F.data == "edit_multiplier_wheel")
         dp.callback_query.register(duel_handler, F.data == "game_duel")
         dp.callback_query.register(dice_handler, F.data == "game_dice")
         dp.callback_query.register(dice_color_handler, F.data.startswith("dice_color_"))
@@ -5994,6 +5951,7 @@ def setup_handlers():
         dp.callback_query.register(activate_promo_handler, F.data == "activate_promo")
         dp.callback_query.register(confirm_set0_handler, F.data == "confirm_set0")
         dp.callback_query.register(cancel_set0_handler, F.data == "cancel_set0")
+        dp.callback_query.register(support_handler, F.data == "support")
 
         # Обработчики профиля
         dp.callback_query.register(edit_profile_handler, F.data == "edit_profile")
@@ -6004,7 +5962,7 @@ def setup_handlers():
         dp.callback_query.register(change_avatar_handler, F.data == "change_avatar")
         dp.callback_query.register(progress_charts_handler, F.data == "progress_charts")
 
-        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "game_duel", "game_dice", "game_basketball", "game_slots", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts"]))
+        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "game_duel", "game_dice", "game_basketball", "game_slots", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts",  "admin_all_open_tickets", "admin_all_tickets", "admin_tickets", "admin_tickets_pending", "admin_tickets_open", "admin_tickets_closed",  "admin_active_chats"]))
 
         # Обработчик ввода суммы
         dp.message.register(process_custom_amount, DepositStates.waiting_for_amount)
@@ -6030,22 +5988,22 @@ def setup_handlers():
         dp.message.register(set_basketball_chance_handler, AdminStates.waiting_for_basketball_chance)
         dp.message.register(set_slots_chance_handler, AdminStates.waiting_for_slots_chance)
         dp.message.register(set_dice_chance_handler, AdminStates.waiting_for_dice_chance)
-        dp.message.register(set_lottery_chance_handler, AdminStates.waiting_for_lottery_chance)
         dp.message.register(set_wheel_chance_handler, AdminStates.waiting_for_wheel_chance)
+        dp.message.register(set_lottery_chance_handler, AdminStates.waiting_for_lottery_chance)
 
         # Обработчики ввода множителей для админов
         dp.message.register(set_duel_multiplier_handler, AdminStates.waiting_for_duel_multiplier)
         dp.message.register(set_basketball_multiplier_handler, AdminStates.waiting_for_basketball_multiplier)
         dp.message.register(set_slots_multiplier_handler, AdminStates.waiting_for_slots_multiplier)
         dp.message.register(set_dice_multiplier_handler, AdminStates.waiting_for_dice_multiplier)
-        dp.message.register(set_lottery_multiplier_handler, AdminStates.waiting_for_lottery_multiplier)
-        dp.message.register(set_wheel_multiplier_handler, AdminStates.waiting_for_wheel_multiplier)
 
         # Обработчики вывода средств
         dp.message.register(withdraw_amount_handler, WithdrawStates.waiting_for_withdraw_amount)
 
         # Обработчики промокодов
         dp.message.register(promo_code_handler, PromoStates.waiting_for_promo_code)
+
+
 
 # Вызываем регистрацию обработчиков
 setup_handlers()
