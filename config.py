@@ -24,8 +24,8 @@ MAX_DEPOSIT = 10000.0
 MIN_WITHDRAWAL = 1.0  # Минимальная сумма вывода (ограничение CryptoBot API)
 
 # Ссылки на FAQ для игр
-DUEL_FAQ_URL = "https://t.me/VanishCasino/10"  # Замените на ссылку для дуэли (кости)
-DICE_FAQ_URL = "https://t.me/VanishCasino/11"  # Замените на ссылку для кубиков
+DUEL_FAQ_URL = "https://t.me/VanishCasino/52"  # Замените на ссылку для дуэли (кости)
+DICE_FAQ_URL = "https://t.me/VanishCasino/53"  # Замените на ссылку для кубиков
 BASKETBALL_FAQ_URL = "https://t.me/VanishCasino/12"  # Замените на ссылку для баскетбола
 SLOTS_FAQ_URL = "https://t.me/VanishCasino/13"  # Замените на ссылку для слотов
 LOTTERY_FAQ_URL = "https://t.me/VanishCasino/15"  # FAQ для лотереи
@@ -68,15 +68,15 @@ DEFAULT_GAME_SETTINGS = {
     'basketball_win_chance': 10.0,
     'slots_win_chance': 4.0,
     'lottery_win_chance': 1.0,   # Шанс выигрыша в лотерее
-    'wheel_win_chance': 2.0,     # Шанс выигрыша в колесе фортуны
+    'wheel_win_chance': 3.0,     # Шанс выигрыша в колесе фортуны
 
     # Множители выигрыша
     'duel_multiplier': 1.8,
     'dice_multiplier': 3.0,
     'basketball_multiplier': 1.5,
-    'slots_multiplier': 8.0,
+    'slots_multiplier': 5.0,
     'lottery_multiplier': 4.0,   # x10 для лотереи
-    'wheel_multiplier': 5.0,      # x5 для колеса фортуны
+    'wheel_multiplier': 4.0,      # x5 для колеса фортуны
 }
 
 # Экспорт новых констант
@@ -91,4 +91,5 @@ __all__ = [
     "GROUPS", "BACKGROUND_IMAGE_URL", "ADMIN_IDS",
     "REFERRAL_BONUS", "REFERRAL_MIN_DEPOSIT", "DAILY_TASKS",
     "DEFAULT_GAME_SETTINGS"
+
 ]
