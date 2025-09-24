@@ -6,11 +6,35 @@ import asyncio
 import threading
 import sys
 import signal
+import os
+import psutil
+import time
 
 # Глобальные переменные
 bot_instance = None
 dp = None
 storage = None
+bot_process_id = None
+
+def check_existing_bot_instances():
+    """Проверка на уже запущенные экземпляры бота"""
+    current_pid = os.getpid()
+    script_name = os.path.basename(__file__)
+
+    print(f"🔍 Проверка запущенных экземпляров бота (PID: {current_pid})...")
+
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if proc.info['pid'] != current_pid:
+                cmdline = proc.info.get('cmdline', [])
+                if cmdline and script_name in ' '.join(cmdline):
+                    print(f"⚠️ Найден другой экземпляр бота (PID: {proc.info['pid']})")
+                    return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    print("✅ Других экземпляров бота не найдено")
+    return False
 
 def initialize_bot():
     """Инициализация бота"""
@@ -28,7 +52,23 @@ def initialize_bot():
 
 def signal_handler(signum, frame, loop):
     """Обработчик сигналов завершения"""
-    print(f"\n🔄 Получен сигнал {signum}. Начинаем корректное завершение...")
+    global bot_process_id
+    signal_names = {
+        signal.SIGINT: "SIGINT (Ctrl+C)",
+        signal.SIGTERM: "SIGTERM"
+    }
+
+    signal_name = signal_names.get(signum, f"сигнал {signum}")
+    print(f"\n🔄 Получен {signal_name}. Начинаем корректное завершение...")
+
+    # Устанавливаем флаг завершения
+    if bot_process_id:
+        try:
+            with open(f"bot_{bot_process_id}.stop", 'w') as f:
+                f.write(str(time.time()))
+        except:
+            pass
+
     loop.call_soon_threadsafe(loop.stop)
 
 def console_input(loop):

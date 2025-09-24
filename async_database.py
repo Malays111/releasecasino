@@ -176,6 +176,36 @@ class AsyncDatabase:
             )
         ''', commit=True)
 
+        # Таблица розыгрышей лотереи
+        await asyncio.to_thread(self._execute_query, '''
+            CREATE TABLE IF NOT EXISTS lottery_draws (
+                id INTEGER PRIMARY KEY,
+                draw_number INTEGER UNIQUE,
+                winning_numbers TEXT,
+                draw_date TIMESTAMP,
+                status TEXT DEFAULT 'active',
+                total_tickets INTEGER DEFAULT 0,
+                total_prize_pool REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''', commit=True)
+
+        # Таблица билетов лотереи
+        await asyncio.to_thread(self._execute_query, '''
+            CREATE TABLE IF NOT EXISTS lottery_tickets (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                telegram_id INTEGER,
+                draw_number INTEGER,
+                ticket_numbers TEXT,
+                purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_winner INTEGER DEFAULT 0,
+                winnings REAL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                FOREIGN KEY (draw_number) REFERENCES lottery_draws (draw_number)
+            )
+        ''', commit=True)
+
         # Инициализация настроек по умолчанию
         default_settings = [
             ('duel_win_chance', 25.0),
@@ -531,6 +561,78 @@ class AsyncDatabase:
             "SELECT amount FROM payments WHERE crypto_bot_invoice_id = ?",
             (invoice_id,), fetchone=True)
         return result[0] if result else None
+
+    # Функции для работы с лотереей
+    async def create_lottery_draw(self, draw_number: int) -> int:
+        """Создание нового розыгрыша лотереи"""
+        return await asyncio.to_thread(self._execute_query,
+            "INSERT INTO lottery_draws (draw_number, draw_date, status) VALUES (?, datetime('now', '+1 hour'), 'active')",
+            (draw_number,), commit=True)
+
+    async def get_current_lottery_draw(self) -> Optional[Tuple]:
+        """Получение текущего активного розыгрыша"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool FROM lottery_draws WHERE status = 'active' ORDER BY draw_number DESC LIMIT 1",
+            fetchone=True)
+
+    async def get_lottery_draw_by_number(self, draw_number: int) -> Optional[Tuple]:
+        """Получение розыгрыша по номеру"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool FROM lottery_draws WHERE draw_number = ?",
+            (draw_number,), fetchone=True)
+
+    async def update_lottery_draw_winning_numbers(self, draw_number: int, winning_numbers: str):
+        """Обновление выигрышных номеров розыгрыша"""
+        await asyncio.to_thread(self._execute_query,
+            "UPDATE lottery_draws SET winning_numbers = ?, status = 'completed' WHERE draw_number = ?",
+            (winning_numbers, draw_number), commit=True)
+
+    async def update_lottery_draw_stats(self, draw_number: int, total_tickets: int, total_prize_pool: float):
+        """Обновление статистики розыгрыша"""
+        await asyncio.to_thread(self._execute_query,
+            "UPDATE lottery_draws SET total_tickets = ?, total_prize_pool = ? WHERE draw_number = ?",
+            (total_tickets, total_prize_pool, draw_number), commit=True)
+
+    async def purchase_lottery_tickets(self, user_id: int, telegram_id: int, draw_number: int, ticket_numbers: str) -> int:
+        """Покупка билетов лотереи"""
+        return await asyncio.to_thread(self._execute_query,
+            "INSERT INTO lottery_tickets (user_id, telegram_id, draw_number, ticket_numbers) VALUES (?, ?, ?, ?)",
+            (user_id, telegram_id, draw_number, ticket_numbers), commit=True)
+
+    async def get_user_lottery_tickets(self, telegram_id: int, draw_number: Optional[int] = None) -> List[Tuple]:
+        """Получение билетов пользователя"""
+        if draw_number:
+            return await asyncio.to_thread(self._execute_query,
+                "SELECT id, user_id, telegram_id, draw_number, ticket_numbers, purchase_date, is_winner, winnings FROM lottery_tickets WHERE telegram_id = ? AND draw_number = ?",
+                (telegram_id, draw_number), fetchall=True)
+        else:
+            return await asyncio.to_thread(self._execute_query,
+                "SELECT id, user_id, telegram_id, draw_number, ticket_numbers, purchase_date, is_winner, winnings FROM lottery_tickets WHERE telegram_id = ? ORDER BY purchase_date DESC",
+                (telegram_id,), fetchall=True)
+
+    async def get_all_tickets_for_draw(self, draw_number: int) -> List[Tuple]:
+        """Получение всех билетов для розыгрыша"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, user_id, telegram_id, ticket_numbers FROM lottery_tickets WHERE draw_number = ?",
+            (draw_number,), fetchall=True)
+
+    async def mark_ticket_as_winner(self, ticket_id: int, winnings: float):
+        """Отметка билета как выигрышного"""
+        await asyncio.to_thread(self._execute_query,
+            "UPDATE lottery_tickets SET is_winner = 1, winnings = ? WHERE id = ?",
+            (winnings, ticket_id), commit=True)
+
+    async def get_lottery_winners(self, draw_number: int) -> List[Tuple]:
+        """Получение списка победителей розыгрыша"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT lt.id, lt.user_id, lt.telegram_id, lt.ticket_numbers, lt.winnings, u.username FROM lottery_tickets lt JOIN users u ON lt.telegram_id = u.telegram_id WHERE lt.draw_number = ? AND lt.is_winner = 1",
+            (draw_number,), fetchall=True)
+
+    async def get_lottery_history(self, limit: int = 10) -> List[Tuple]:
+        """Получение истории розыгрышей"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool FROM lottery_draws ORDER BY draw_number DESC LIMIT ?",
+            (limit,), fetchall=True)
 
     async def close(self):
         """Закрытие базы данных и ThreadPoolExecutor"""

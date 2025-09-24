@@ -7,7 +7,8 @@ from config import (
     SUPPORTED_ASSETS, DEFAULT_ASSET, DEFAULT_CURRENCY_TYPE, DEFAULT_FIAT,
     INVOICE_EXPIRES_IN, MIN_DEPOSIT, MAX_DEPOSIT, MIN_WITHDRAWAL,
     DUEL_FAQ_URL, DICE_FAQ_URL, BASKETBALL_FAQ_URL, SLOTS_FAQ_URL,
-    BLACKJACK_FAQ_URL, DARTS_FAQ_URL, BACKGROUND_IMAGE_URL,
+    LOTTERY_FAQ_URL, WHEEL_FAQ_URL,
+    BACKGROUND_IMAGE_URL,
     ADMIN_IDS, REFERRAL_BONUS, REFERRAL_MIN_DEPOSIT, DAILY_TASKS, GROUPS,
     DEFAULT_GAME_SETTINGS
 )
@@ -23,7 +24,7 @@ from crypto_bot import crypto_bot
 import asyncio
 import random
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # Глобальные переменные
 bot = None
@@ -275,6 +276,9 @@ async def preload_data():
 
         # Запускаем автоматическую проверку платежей
         asyncio.create_task(auto_check_payments())
+
+        # Запускаем планировщик лотереи
+        asyncio.create_task(lottery_scheduler())
 
         print("✅ Предварительная загрузка завершена")
     except Exception as e:
@@ -549,14 +553,16 @@ DUEL_WIN_CHANCE = settings.get('duel_win_chance', 7.0)
 DICE_WIN_CHANCE = settings.get('dice_win_chance', 5.0)
 BASKETBALL_WIN_CHANCE = settings.get('basketball_win_chance', 10.0)
 SLOTS_WIN_CHANCE = settings.get('slots_win_chance', 4.0)
-BLACKJACK_WIN_CHANCE = settings.get('blackjack_win_chance', 3.0)
+LOTTERY_WIN_CHANCE = settings.get('lottery_win_chance', 15.0)
+WHEEL_WIN_CHANCE = settings.get('wheel_win_chance', 25.0)
 
 # Множители выигрыша
 DUEL_MULTIPLIER = settings.get('duel_multiplier', 1.8)
 DICE_MULTIPLIER = settings.get('dice_multiplier', 5.0)
 BASKETBALL_MULTIPLIER = settings.get('basketball_multiplier', 1.5)
 SLOTS_MULTIPLIER = settings.get('slots_multiplier', 8.0)
-BLACKJACK_MULTIPLIER = settings.get('blackjack_multiplier', 2.0)
+LOTTERY_MULTIPLIER = settings.get('lottery_multiplier', 10.0)
+WHEEL_MULTIPLIER = settings.get('wheel_multiplier', 5.0)
 
 # Состояния для FSM
 class DepositStates(StatesGroup):
@@ -574,12 +580,10 @@ class AdminStates(StatesGroup):
     waiting_for_dice_chance = State()
     waiting_for_basketball_chance = State()
     waiting_for_slots_chance = State()
-    waiting_for_blackjack_chance = State()
     waiting_for_duel_multiplier = State()
     waiting_for_dice_multiplier = State()
     waiting_for_basketball_multiplier = State()
     waiting_for_slots_multiplier = State()
-    waiting_for_blackjack_multiplier = State()
 
 class WithdrawStates(StatesGroup):
     waiting_for_wallet_address = State()
@@ -597,7 +601,10 @@ class BasketballStates(StatesGroup):
 class SlotsStates(StatesGroup):
     waiting_for_bet = State()
 
-class BlackjackStates(StatesGroup):
+class LotteryStates(StatesGroup):
+    waiting_for_ticket_count = State()
+
+class WheelStates(StatesGroup):
     waiting_for_bet = State()
 
 # Главное меню
@@ -653,8 +660,8 @@ async def get_main_menu(user_id=None):
 
 def get_admin_panel():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Шансы", callback_data="admin_chances")],
-        [InlineKeyboardButton(text="⚡ Множитель", callback_data="admin_multiplier")],
+        [InlineKeyboardButton(text="📈 Все шансы игр", callback_data="admin_all_chances")],
+        [InlineKeyboardButton(text="⚡ Множители", callback_data="admin_multiplier")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="💰 Установить баланс", callback_data="admin_set_balance")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
@@ -679,12 +686,15 @@ def get_games_menu():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🎲 Кости", callback_data="game_duel"),
-            InlineKeyboardButton(text="🎁 Кубикии", callback_data="game_dice"),
+            InlineKeyboardButton(text="🎁 Кубики", callback_data="game_dice"),
             InlineKeyboardButton(text="🏀 Баскетбол", callback_data="game_basketball")
         ],
         [
             InlineKeyboardButton(text="🎰 Слоты", callback_data="game_slots"),
-            InlineKeyboardButton(text="🃏 BlackJack", callback_data="game_blackjack"),
+            InlineKeyboardButton(text="🎲 Лотерея", callback_data="game_lottery"),
+            InlineKeyboardButton(text="🎡 Колесо", callback_data="game_wheel")
+        ],
+        [
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
         ]
     ])
@@ -1484,12 +1494,10 @@ async def clear_all_databases():
             ('dice_win_chance', 30.0),
             ('basketball_win_chance', 10.0),
             ('slots_win_chance', 15.0),
-            ('blackjack_win_chance', 40.0),
             ('duel_multiplier', 1.8),
             ('dice_multiplier', 5.0),
             ('basketball_multiplier', 1.5),
-            ('slots_multiplier', 8.0),
-            ('blackjack_multiplier', 2.0)
+            ('slots_multiplier', 8.0)
         ]
 
         for key, value in default_settings:
@@ -2003,21 +2011,84 @@ async def chances_handler(callback_query: types.CallbackQuery):
 
 🎲 Кости: {DUEL_WIN_CHANCE}% (x{DUEL_MULTIPLIER}) <a href="{DUEL_FAQ_URL}">faq</a>
 🏀 Баскетбол: {BASKETBALL_WIN_CHANCE}% (x{BASKETBALL_MULTIPLIER}) <a href="{BASKETBALL_FAQ_URL}">faq</a>
-🎯 Дартс: 30% (x2.0) <a href="{DARTS_FAQ_URL}">faq</a>
 🎰 Слоты: {SLOTS_WIN_CHANCE}% (x{SLOTS_MULTIPLIER}) <a href="{SLOTS_FAQ_URL}">faq</a>
-🎳 Кубикии: {DICE_WIN_CHANCE}% (x{DICE_MULTIPLIER}) <a href="{DICE_FAQ_URL}">faq</a>
-🃏 BlackJack: {BLACKJACK_WIN_CHANCE}% (x{BLACKJACK_MULTIPLIER}) <a href="{BLACKJACK_FAQ_URL}">faq</a>
+🎳 Кубики: {DICE_WIN_CHANCE}% (x{DICE_MULTIPLIER}) <a href="{DICE_FAQ_URL}">faq</a>
 
 💡 Шансы приблизительные и могут меняться.
 🏀 Баскетбол - игра на предсказание результата броска.
-🎰 Слоты - классическая игра с тремя барабанами.
-🃏 BlackJack - классическая игра с дилером."""
+🎰 Слоты - классическая игра с тремя барабанами."""
 
     try:
         media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=chances_text)
         await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
     except:
         await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=chances_text, reply_markup=get_back_button())
+    await callback_query.answer()
+
+# Обработчик кнопки "📈 Все шансы игр" для админов
+async def admin_all_chances_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    all_chances_text = f"""📈 <b>ВСЕ ШАНСЫ И МНОЖИТЕЛИ ИГР</b>
+
+┌─ <b>🎲 КОСТИ (Duel)</b> ─┐
+│ Шанс выигрыша: <code>{DUEL_WIN_CHANCE}%</code>
+│ Множитель: <code>x{DUEL_MULTIPLIER}</code>
+│ FAQ: <a href="{DUEL_FAQ_URL}">ссылка</a>
+└─────────────────────┘
+
+┌─ <b>🏀 БАСКЕТБОЛ</b> ─┐
+│ Шанс выигрыша: <code>{BASKETBALL_WIN_CHANCE}%</code>
+│ Множитель: <code>x{BASKETBALL_MULTIPLIER}</code>
+│ FAQ: <a href="{BASKETBALL_FAQ_URL}">ссылка</a>
+└─────────────────┘
+
+┌─ <b>🎰 СЛОТЫ</b> ─┐
+│ Шанс выигрыша: <code>{SLOTS_WIN_CHANCE}%</code>
+│ Множитель: <code>x{SLOTS_MULTIPLIER}</code>
+│ FAQ: <a href="{SLOTS_FAQ_URL}">ссылка</a>
+└──────────────┘
+
+┌─ <b>🎳 КУБИКИ</b> ─┐
+│ Шанс выигрыша: <code>{DICE_WIN_CHANCE}%</code>
+│ Множитель: <code>x{DICE_MULTIPLIER}</code>
+│ FAQ: <a href="{DICE_FAQ_URL}">ссылка</a>
+└─────────────┘
+
+┌─ <b>🎡 КОЛЕСО ФОРТУНЫ</b> ─┐
+│ Шанс выигрыша: <code>{WHEEL_WIN_CHANCE}%</code>
+│ Множитель: <code>x{WHEEL_MULTIPLIER}</code>
+│ FAQ: <a href="{WHEEL_FAQ_URL}">ссылка</a>
+└────────────────────┘
+
+┌─ <b>🎲 ЛОТЕРЕЯ</b> ─┐
+│ Шанс выигрыша: <code>{LOTTERY_WIN_CHANCE}%</code>
+│ Множитель: <code>x{LOTTERY_MULTIPLIER}</code>
+│ FAQ: <a href="{LOTTERY_FAQ_URL}">ссылка</a>
+└──────────────┘
+
+💡 <b>Управление шансами:</b>
+• Используйте кнопки ниже для изменения
+• Изменения применяются мгновенно
+• Шансы хранятся в базе данных"""
+
+    chances_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Кости", callback_data="edit_chance_duel")],
+        [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_chance_basketball")],
+        [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_chance_slots")],
+        [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_chance_dice")],
+        [InlineKeyboardButton(text="🎡 Колесо", callback_data="edit_chance_wheel")],
+        [InlineKeyboardButton(text="🎲 Лотерея", callback_data="edit_chance_lottery")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=all_chances_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=chances_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=all_chances_text, reply_markup=chances_keyboard, parse_mode="HTML")
     await callback_query.answer()
 
 # Обработчик админ панели шансов
@@ -2032,7 +2103,6 @@ async def admin_chances_handler(callback_query: types.CallbackQuery):
 🏀 Баскетбол: {BASKETBALL_WIN_CHANCE}%
 🎰 Слоты: {SLOTS_WIN_CHANCE}%
 🎳 Кубики: {DICE_WIN_CHANCE}%
-🃏 BlackJack: {BLACKJACK_WIN_CHANCE}%
 
 Выберите игру для изменения шансов:"""
 
@@ -2041,7 +2111,6 @@ async def admin_chances_handler(callback_query: types.CallbackQuery):
         [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_chance_basketball")],
         [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_chance_slots")],
         [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_chance_dice")],
-        [InlineKeyboardButton(text="🃏 BlackJack", callback_data="edit_chance_blackjack")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
     ])
 
@@ -2104,18 +2173,6 @@ async def edit_chance_slots_handler(callback_query: types.CallbackQuery, state: 
         await callback_query.message.answer(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
     await callback_query.answer()
 
-# Обработчик редактирования шанса blackjack
-async def edit_chance_blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_for_blackjack_chance)
-    try:
-        await callback_query.message.edit_text(f"🃏 Введите новый шанс выигрыша для BlackJack (текущий: {BLACKJACK_WIN_CHANCE}%):", reply_markup=get_back_button())
-    except:
-        await callback_query.message.answer(f"🃏 Введите новый шанс выигрыша для BlackJack (текущий: {BLACKJACK_WIN_CHANCE}%):", reply_markup=get_back_button())
-    await callback_query.answer()
 
 # Обработчик ввода нового шанса дуэли
 async def set_duel_chance_handler(message: types.Message, state: FSMContext):
@@ -2233,34 +2290,6 @@ async def set_slots_chance_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
-# Обработчик ввода нового шанса blackjack
-async def set_blackjack_chance_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
-
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    try:
-        new_chance = float(message.text.strip())
-        if not 0 <= new_chance <= 100:
-            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
-            return
-
-        global BLACKJACK_WIN_CHANCE
-        BLACKJACK_WIN_CHANCE = new_chance
-        await async_save_game_setting('blackjack_win_chance', new_chance)
-        try:
-            await message.answer(f"✅ Шанс выигрыша в BlackJack изменен на {new_chance}%", reply_markup=get_admin_panel())
-        except:
-            pass
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
 # Обработчик админ панели множителей
 async def admin_multiplier_handler(callback_query: types.CallbackQuery):
@@ -2274,7 +2303,6 @@ async def admin_multiplier_handler(callback_query: types.CallbackQuery):
 🏀 Баскетбол: x{BASKETBALL_MULTIPLIER}
 🎰 Слоты: x{SLOTS_MULTIPLIER}
 🎳 Кубики: x{DICE_MULTIPLIER}
-🃏 BlackJack: x{BLACKJACK_MULTIPLIER}
 
 Выберите игру для изменения множителя:"""
 
@@ -2283,8 +2311,7 @@ async def admin_multiplier_handler(callback_query: types.CallbackQuery):
         [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_multiplier_basketball")],
         [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_multiplier_slots")],
         [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_multiplier_dice")],
-        [InlineKeyboardButton(text="🃏 BlackJack", callback_data="edit_multiplier_blackjack")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
     try:
@@ -2300,8 +2327,49 @@ async def admin_panel_handler(callback_query: types.CallbackQuery):
         await callback_query.answer("❌ Доступ запрещен", show_alert=True)
         return
 
-    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption="🔧 Админ панель")
-    await callback_query.message.edit_media(media=media, reply_markup=get_admin_panel())
+    # Показываем все шансы игр в админ панели
+    admin_panel_text = f"""🔧 <b>Админ панель</b>
+
+📈 <b>Текущие шансы:</b>
+🎲 Кости: {DUEL_WIN_CHANCE}% (x{DUEL_MULTIPLIER})
+🏀 Баскетбол: {BASKETBALL_WIN_CHANCE}% (x{BASKETBALL_MULTIPLIER})
+🎰 Слоты: {SLOTS_WIN_CHANCE}% (x{SLOTS_MULTIPLIER})
+🎳 Кубики: {DICE_WIN_CHANCE}% (x{DICE_MULTIPLIER})
+🎡 Колесо: {WHEEL_WIN_CHANCE}% (x{WHEEL_MULTIPLIER})
+🎲 Лотерея: {LOTTERY_WIN_CHANCE}% (x{LOTTERY_MULTIPLIER})
+
+📋 <b>Основные команды:</b>
+
+<b>💰 Баланс:</b>
+• <code>/give @user сумма</code> - выдать деньги
+• <code>/set @user баланс</code> - установить баланс
+
+<b>🗄️ База данных:</b>
+• <code>/set0</code> - очистить ВСЕ данные (ОПАСНО!)
+
+<b>💬 Чат:</b>
+• <code>/chat текст</code> - сообщение всем
+
+<b>🎭 Фейк:</b>
+• <code>/fake @user сумма</code> - фейковый вывод
+
+<b>📊 Статистика:</b>
+• <code>/stats</code> - статистика пользователей
+• <code>/logs</code> - логи действий
+
+<b>👥 Группы:</b>
+• <code>/setgroup ID</code> - установить группу результатов
+• <code>/setvip ID</code> - установить VIP группу
+
+<b>🎫 Промокоды:</b>
+• <code>/createpromo КОД СУММА МАКС</code> - создать
+• <code>/listpromo</code> - список всех"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=admin_panel_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_admin_panel())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=admin_panel_text, reply_markup=get_admin_panel(), parse_mode="HTML")
     await callback_query.answer()
 
 # Обработчик кнопки "📊 Статистика"
@@ -2404,18 +2472,6 @@ async def edit_multiplier_slots_handler(callback_query: types.CallbackQuery, sta
         await callback_query.message.answer(f"🎰 Введите новый множитель для Слотов (текущий: x{SLOTS_MULTIPLIER}):", reply_markup=get_back_button())
     await callback_query.answer()
 
-# Обработчик редактирования множителя blackjack
-async def edit_multiplier_blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id not in ADMIN_IDS:
-        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await state.set_state(AdminStates.waiting_for_blackjack_multiplier)
-    try:
-        await callback_query.message.edit_text(f"🃏 Введите новый множитель для BlackJack (текущий: x{BLACKJACK_MULTIPLIER}):", reply_markup=get_back_button())
-    except:
-        await callback_query.message.answer(f"🃏 Введите новый множитель для BlackJack (текущий: x{BLACKJACK_MULTIPLIER}):", reply_markup=get_back_button())
-    await callback_query.answer()
 
 # Обработчик ввода нового множителя дуэли
 async def set_duel_multiplier_handler(message: types.Message, state: FSMContext):
@@ -2533,34 +2589,6 @@ async def set_slots_multiplier_handler(message: types.Message, state: FSMContext
     except ValueError:
         await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
-# Обработчик ввода нового множителя blackjack
-async def set_blackjack_multiplier_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
-
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    try:
-        new_multiplier = float(message.text.strip())
-        if new_multiplier <= 0:
-            await message.answer("❌ Множитель должен быть больше 0", reply_markup=get_back_button())
-            return
-
-        global BLACKJACK_MULTIPLIER
-        BLACKJACK_MULTIPLIER = new_multiplier
-        await async_save_game_setting('blackjack_multiplier', new_multiplier)
-        try:
-            await message.answer(f"✅ Множитель выигрыша в BlackJack изменен на x{new_multiplier}", reply_markup=get_admin_panel())
-        except:
-            pass
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
 # Обработчик кнопки "🎮 Играть"
 async def play_handler(callback_query: types.CallbackQuery):
@@ -2758,7 +2786,7 @@ async def basketball_handler(callback_query: types.CallbackQuery, state: FSMCont
     # Отправить результат в группу
     if results_group_id:
         try:
-            group_text = f"🃏 BlackJack\n👤 {user.first_name or user.username}\n💰 Ставка: {bet}$\nПеребор! -{bet}$"
+            group_text = f"🏀 Баскетбол\n👤 {user.first_name or user.username}\n💰 Ставка: {bet}$\nПеребор! -{bet}$"
             await bot.send_message(chat_id=results_group_id, text=group_text)
         except:
             pass
@@ -2931,7 +2959,30 @@ async def process_basketball_prediction(callback_query: types.CallbackQuery, pre
         status_emoji = "😞"
 
     # Показать предсказание игрока
-    prediction_text = "🎯 Попадет"
+    prediction_text = "🏀 Бросок"
+
+    # Красивая анимация броска в баскетбол
+    basketball_frames = [
+        "🏀 Готовимся к броску...\n     ⭕\n    🏀\n     ⬆️",
+        "🏀 Бросок выполнен!\n   ⭕   \n  🏀  \n     ⬆️",
+        "🏀 Мяч в полете...\n ⭕     \n🏀      \n     ⬆️",
+        "🏀 Приближается к кольцу...\n   ⭕\n    🏀\n     ⬆️",
+        f"🏀 РЕЗУЛЬТАТ!\n   ⭕\n    🏀\n     {'🎉' if actual_result == 'hit' else '😞'}"
+    ]
+
+    for i, frame in enumerate(basketball_frames[:-1]):
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+        await asyncio.sleep(0.8 + i * 0.1)
 
     print(f"Результат баскетбола: actual_result={actual_result}, prediction_correct={prediction_correct}, game_result={game_result}")
 
@@ -3003,7 +3054,7 @@ async def slots_handler(callback_query: types.CallbackQuery, state: FSMContext):
 
     slots_text = f"""💎 Баланс: {balance}$
 
-🎰 Слоты 
+🎰 Слоты
 
 ♻️ Множитель: x{SLOTS_MULTIPLIER}
 
@@ -3020,32 +3071,141 @@ async def slots_handler(callback_query: types.CallbackQuery, state: FSMContext):
     await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
     await callback_query.answer()
 
-# Обработчик кнопки "BlackJack"
-async def blackjack_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    await state.set_state(BlackjackStates.waiting_for_bet)
+
+# Обработчик кнопки "Лотерея"
+async def lottery_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(LotteryStates.waiting_for_ticket_count)
 
     user = callback_query.from_user
     user_data = await async_get_user(user.id)
     balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
 
-    blackjack_text = f"""💎 Баланс: {balance}$
+    # Получаем информацию о текущем розыгрыше
+    current_draw = await async_db.get_current_lottery_draw()
+    lottery_info = ""
 
-🃏 BlackJack 
+    if current_draw:
+        draw_id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool = current_draw
 
-♻️ Множитель: x{BLACKJACK_MULTIPLIER}
+        # Получаем количество билетов пользователя в текущем розыгрыше
+        user_tickets = await async_db.get_user_lottery_tickets(user.id, draw_number)
+        user_ticket_count = len(user_tickets) if user_tickets else 0
 
-💰 Введите ставку в $:"""
+        # Получаем количество уникальных участников
+        all_tickets = await async_db.get_all_tickets_for_draw(draw_number)
+        unique_participants = len(set(ticket[2] for ticket in all_tickets))  # telegram_id уникальных участников
+
+        # Вычисляем время до следующего розыгрыша
+        from datetime import datetime, timedelta
+        try:
+            # Пробуем разные форматы даты
+            time_str = "Скоро"
+            try:
+                if isinstance(draw_date, str):
+                    # Если дата в формате ISO с Z
+                    if draw_date.endswith('Z'):
+                        draw_datetime = datetime.fromisoformat(draw_date.replace('Z', '+00:00'))
+                    else:
+                        draw_datetime = datetime.fromisoformat(draw_date)
+                else:
+                    # Если дата уже объект datetime
+                    draw_datetime = draw_date
+
+                current_datetime = datetime.now(draw_datetime.tzinfo) if draw_datetime.tzinfo else datetime.now()
+                time_to_start = draw_datetime - current_datetime
+
+                if time_to_start.total_seconds() > 0:
+                    # Розыгрыш еще не начался - показываем время до начала
+                    hours, remainder = divmod(int(time_to_start.total_seconds()), 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                else:
+                    # Розыгрыш уже идет - показываем время до окончания (добавляем 1 час)
+                    end_datetime = draw_datetime + timedelta(hours=1)
+                    time_to_end = end_datetime - current_datetime
+
+                    if time_to_end.total_seconds() > 0:
+                        hours, remainder = divmod(int(time_to_end.total_seconds()), 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        time_str = f"До окончания: {hours:02d}:{minutes:02d}:{seconds:02d}"
+                    else:
+                        time_str = "Заканчивается..."
+            except:
+                # Если не удалось распарсить дату, показываем "Скоро"
+                time_str = "Скоро"
+        except:
+            time_str = "Скоро"
+
+        # Определяем статус розыгрыша
+        if unique_participants >= 5:
+            status_text = "🟢 Готов к розыгрышу"
+        else:
+            status_text = f"🟡 Ждет участников ({unique_participants}/5)"
+
+        lottery_info = f"""
+🎫 <b>Текущий розыгрыш #{draw_number}</b>
+⏰ До розыгрыша: {time_str}
+👥 Участников: {unique_participants}/5
+🎫 Всего билетов: {total_tickets or 0}
+💰 Призовой фонд: {total_prize_pool or 0}$
+🎫 Ваших билетов: {user_ticket_count}
+📊 Статус: {status_text}"""
+
+    lottery_text = f"""💎 Баланс: {balance}$
+
+🎲 Лотерея <a href="{LOTTERY_FAQ_URL}">faq</a>
+
+🎫 Купите билеты с числами 1-50
+💰 Цена билета: 1$
+🎯 Розыгрыш: каждый час
+🏆 Джекпот: x{LOTTERY_MULTIPLIER}{lottery_info}
+
+💰 Сколько билетов купить?"""
 
     try:
-        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=blackjack_text, parse_mode="HTML")
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=lottery_text, parse_mode="HTML")
         await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
         message_id = callback_query.message.message_id
     except:
-        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=blackjack_text, reply_markup=get_back_button(), parse_mode="HTML")
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=lottery_text, reply_markup=get_back_button(), parse_mode="HTML")
         message_id = new_msg.message_id
 
     await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
     await callback_query.answer()
+
+# Обработчик кнопки "Колесо фортуны"
+async def wheel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(WheelStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    wheel_text = f"""💎 Баланс: {balance}$
+
+🎡 Колесо фортуны <a href="{WHEEL_FAQ_URL}">faq</a>
+
+🎨 Сектора:
+• x2, x5, x10 - множители
+• 💎 Джекпот - x{WHEEL_MULTIPLIER}
+• ❌ x0 - проигрыш
+• 🎁 Бонус - +ставка
+
+♻️ Средний множитель: x{WHEEL_MULTIPLIER}
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=wheel_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=wheel_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
 
 # Обработчик ввода ставки в слоты
 async def slots_bet_handler(message: types.Message, state: FSMContext):
@@ -3170,392 +3330,8 @@ async def slots_bet_handler(message: types.Message, state: FSMContext):
         else:
             await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
 
-# Обработчик ввода ставки в blackjack
-async def blackjack_bet_handler(message: types.Message, state: FSMContext):
-    # Удаляем сообщение пользователя
-    try:
-        await message.delete()
-    except:
-        pass
 
-    try:
-        bet = float(message.text.strip())
-        if bet < 1.0:
-            # Получаем данные для редактирования
-            data = await state.get_data()
-            message_id = data.get('message_id')
-            chat_id = data.get('chat_id')
 
-            error_text = """❌ Ошибка ставки
-
-Ставка должна быть не менее 1.0$
-
-<b> Введите новую ставку в чат </b>"""
-
-            if message_id and chat_id:
-                try:
-                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
-                    await bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        media=media,
-                        reply_markup=get_back_button()
-                    )
-                except Exception as e:
-                    print(f"Ошибка редактирования сообщения: {e}")
-                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
-            else:
-                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
-            return
-
-        user_data = await async_get_user(message.from_user.id)
-        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
-
-        if bet > balance:
-            # Получаем данные для редактирования
-            data = await state.get_data()
-            message_id = data.get('message_id')
-            chat_id = data.get('chat_id')
-
-            error_text = f"""❌ <b>Недостаточно средств</b>
-
-Ваш баланс: <code>{balance}$</code>
-Запрошенная ставка: <code>{bet}$</code>"""
-
-            if message_id and chat_id:
-                try:
-                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
-                    await bot.edit_message_media(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        media=media,
-                        reply_markup=get_back_button()
-                    )
-                except Exception as e:
-                    print(f"Ошибка редактирования сообщения: {e}")
-                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
-            else:
-                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
-            return
-
-        data = await state.get_data()
-        message_id = data.get('message_id')
-
-        # Начало игры blackjack
-        # Раздаем карты
-        deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4  # Упрощенная колода
-        random.shuffle(deck)
-
-        player_cards = [deck.pop(), deck.pop()]
-        dealer_cards = [deck.pop(), deck.pop()]
-
-        player_score = sum(player_cards)
-        dealer_score = sum(dealer_cards)
-
-        game_text = f"""💎 Баланс: {balance}$
-
-🃏 BlackJack <a href="{BLACKJACK_FAQ_URL}">faq</a>
-
-♻️ Множитель: x{BLACKJACK_MULTIPLIER}
-💰 Ставка: {bet}$
-
-Ваши карты: {player_cards} (Ваши карты: {player_score})
-Карта дилера: {dealer_cards[0]} (Карты диллера: ?)"""
-
-        game_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🃏 Еще карту", callback_data=f"blackjack_hit_{bet}_{player_cards[0]}_{player_cards[1]}_{dealer_cards[0]}_{dealer_cards[1]}"),
-                InlineKeyboardButton(text="⏹️ Стоп", callback_data=f"blackjack_stand_{bet}_{player_cards[0]}_{player_cards[1]}_{dealer_cards[0]}_{dealer_cards[1]}")
-            ],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_blackjack")]
-        ])
-
-        # Редактируем сообщение с игрой
-        if message_id:
-            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=game_text, parse_mode="HTML")
-            await bot.edit_message_media(
-                chat_id=message.chat.id,
-                message_id=message_id,
-                media=media,
-                reply_markup=game_keyboard
-            )
-        else:
-            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=game_text, reply_markup=game_keyboard, parse_mode="HTML")
-
-        await state.clear()
-
-    except ValueError:
-        await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
-
-# Обработчик "Еще карту" в blackjack
-async def blackjack_hit_handler(callback_query: types.CallbackQuery):
-    data = callback_query.data.split("_")
-    bet = float(data[2])
-    player_cards = [int(x) for x in data[3:-2]]
-    dealer_cards = [int(data[-2]), int(data[-1])]
-
-    user = callback_query.from_user
-
-    print(f"Начало blackjack hit: user={user.id}, bet={bet}, player_cards={player_cards}, dealer_cards={dealer_cards}")
-
-    # Добавляем карту игроку
-    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
-    random.shuffle(deck)
-    # Убираем уже розданные карты
-    for card in player_cards + dealer_cards:
-        if card in deck:
-            deck.remove(card)
-
-    new_card = deck.pop()
-    player_cards.append(new_card)
-    player_score = sum(player_cards)
-
-    # Rigged логика: шанс выигрыша BLACKJACK_WIN_CHANCE%
-    if BLACKJACK_WIN_CHANCE >= 100:
-        # При 100% шансе всегда выигрыш - не даем перебор
-        winnings = bet * BLACKJACK_MULTIPLIER
-        await async_update_games_played(user.id)
-        await async_update_balance(user.id, winnings)
-        await invalidate_balance_cache(user.id)
-        result_text = f"🎉 Вы выиграли! +{winnings}$"
-        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
-            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
-        ])
-
-        photo_url = WIN_IMAGE_URL
-        game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
-Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
-
-{result_text}"""
-        media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
-        await bot.edit_message_media(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            media=media,
-            reply_markup=result_keyboard
-        )
-    elif BLACKJACK_WIN_CHANCE <= 0:
-        # При 0% шансе всегда проигрыш - даем перебор
-        await async_update_games_played(user.id)
-        await async_update_balance(user.id, -bet)
-        await invalidate_balance_cache(user.id)
-        result_text = f"😞 Вы проиграли! -{bet}$"
-        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
-            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
-        ])
-
-        photo_url = LOSE_IMAGE_URL
-        game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
-Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
-
-{result_text}"""
-        media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
-        await bot.edit_message_media(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            media=media,
-            reply_markup=result_keyboard
-        )
-    else:
-        # Нормальная логика игры
-        if player_score > 21:
-            # Перебор
-            await async_update_games_played(user.id)
-            await async_update_balance(user.id, -bet)
-            await invalidate_balance_cache(user.id)
-            result_text = f"Перебор! -{bet}$"
-            result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
-                [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
-            ])
-
-            photo_url = LOSE_IMAGE_URL
-            game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
-Карты дилера: {dealer_cards} (Очки: {sum(dealer_cards)})
-
-{result_text}"""
-            media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
-            await bot.edit_message_media(
-                chat_id=callback_query.message.chat.id,
-                message_id=callback_query.message.message_id,
-                media=media,
-                reply_markup=result_keyboard
-            )
-
-        print(f"Результат blackjack hit (перебор): player_score={player_score}, result_text={result_text}")
-
-        # Отправить результат в группу
-        print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
-        if results_group_id:
-            print(f"Отправка результата blackjack в группу {results_group_id}")
-            try:
-                username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-                if "+" in result_text:
-                    winnings = result_text.split()[-1]
-                    winnings_label = "Выигрыш"
-                elif "-" in result_text:
-                    winnings = f"-{bet}$"
-                    winnings_label = "Проигрыш"
-                else:
-                    winnings = "0$"
-                    winnings_label = "Выигрыш"
-                group_text = f"""📎 Игра: BlackJack
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text}
-💲 {winnings_label}: {winnings}"""
-                photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-                await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-                print("Результат blackjack отправлен успешно")
-            except Exception as e:
-                print(f"Ошибка отправки в группу: {e}")
-                pass
-        else:
-            print("Группа для результатов не установлена")
-        # Продолжаем игру
-        game_text = f"""Ваши карты: {player_cards} (Очки: {player_score})
-Карта дилера: {dealer_cards[0]} (Очки: ?)"""
-
-        game_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🃏 Еще карту", callback_data=f"blackjack_hit_{bet}_{'_'.join(map(str, player_cards))}_{dealer_cards[0]}_{dealer_cards[1]}"),
-                InlineKeyboardButton(text="⏹️ Стоп", callback_data=f"blackjack_stand_{bet}_{'_'.join(map(str, player_cards))}_{dealer_cards[0]}_{dealer_cards[1]}")
-            ],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_blackjack")]
-        ])
-        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=game_text, parse_mode="HTML")
-        await bot.edit_message_media(
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            media=media,
-            reply_markup=game_keyboard
-        )
-
-    await callback_query.answer()
-
-# Обработчик "Стоп" в blackjack
-async def blackjack_stand_handler(callback_query: types.CallbackQuery):
-    data = callback_query.data.split("_")
-    bet = float(data[2])
-    player_cards = [int(x) for x in data[3:-2]]
-    dealer_cards = [int(data[-2]), int(data[-1])]
-
-    user = callback_query.from_user
-
-    print(f"Начало blackjack stand: user={user.id}, bet={bet}, player_cards={player_cards}, dealer_cards={dealer_cards}")
-
-    # Дилер берет карты до 17
-    deck = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11] * 4
-    random.shuffle(deck)
-    # Убираем уже розданные карты
-    for card in player_cards + dealer_cards:
-        if card in deck:
-            deck.remove(card)
-
-    dealer_score = sum(dealer_cards)
-    # Rigged логика: в 99% случаев дилер набирает ровно 21 очко
-    if random.random() < 0.99:
-        # Дилер набирает карты до 21
-        while dealer_score < 21:
-            if not deck:
-                break  # Если колода закончилась, останавливаемся
-            new_card = deck.pop()
-            dealer_cards.append(new_card)
-            dealer_score = sum(dealer_cards)
-    else:
-        # В 1% случаев используем стандартную логику (до 17)
-        while dealer_score < 17:
-            if not deck:
-                break  # Если колода закончилась, останавливаемся
-            new_card = deck.pop()
-            dealer_cards.append(new_card)
-            dealer_score = sum(dealer_cards)
-
-    player_score = sum(player_cards)
-
-    await async_update_games_played(user.id)
-
-    # Rigged логика: шанс выигрыша BLACKJACK_WIN_CHANCE%
-    if BLACKJACK_WIN_CHANCE >= 100:
-        # При 100% шансе всегда выигрыш
-        winnings = bet * BLACKJACK_MULTIPLIER
-        await async_update_balance(user.id, winnings)
-        await invalidate_balance_cache(user.id)
-        result_text = f"🎉 Вы выиграли! +{winnings}$"
-    elif BLACKJACK_WIN_CHANCE <= 0:
-        # При 0% шансе всегда проигрыш
-        await async_update_balance(user.id, -bet)
-        await invalidate_balance_cache(user.id)
-        result_text = f"😞 Вы проиграли! -{bet}$"
-    else:
-        # Нормальная логика игры
-        if dealer_score > 21 or player_score > dealer_score:
-            # Выигрыш игрока
-            winnings = bet * BLACKJACK_MULTIPLIER
-            await async_update_balance(user.id, winnings)
-            await invalidate_balance_cache(user.id)
-            result_text = f"🎉 Вы выиграли! +{winnings}$"
-        elif player_score == dealer_score:
-            # Ничья
-            result_text = f"🤝 Ничья! Ставка возвращена"
-        else:
-            # Проигрыш
-            await async_update_balance(user.id, -bet)
-            await invalidate_balance_cache(user.id)
-            result_text = f"😞 Вы проиграли! -{bet}$"
-
-    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🃏 Играть еще", callback_data="game_blackjack")],
-        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
-    ])
-
-    photo_url = WIN_IMAGE_URL if dealer_score > 21 or player_score > dealer_score else LOSE_IMAGE_URL if player_score < dealer_score else WIN_IMAGE_URL  # Ничья как выигрыш
-    game_caption = f"""Ваши карты: {player_cards} (Очки: {player_score})
-Карты дилера: {dealer_cards} (Очки: {dealer_score})
-
-{result_text}"""
-    media = InputMediaPhoto(media=photo_url, caption=game_caption, parse_mode="HTML")
-    await bot.edit_message_media(
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        media=media,
-        reply_markup=result_keyboard
-    )
-
-    print(f"Результат blackjack stand: player_score={player_score}, dealer_score={dealer_score}, result_text={result_text}")
-
-    # Отправить результат в группу
-    print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
-    if results_group_id:
-        print(f"Отправка результата blackjack в группу {results_group_id}")
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if "+" in result_text:
-                winnings = result_text.split()[-1]
-                winnings_label = "Выигрыш"
-            elif "-" in result_text:
-                winnings = f"-{bet}$"
-                winnings_label = "Проигрыш"
-            else:
-                winnings = "0$"
-                winnings_label = "Выигрыш"
-            group_text = f"""📎 Игра: BlackJack
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text}
-💲 {winnings_label}: {winnings}"""
-            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-            print("Результат blackjack отправлен успешно")
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
-            pass
-    else:
-        print("Группа для результатов не установлена")
-
-    await callback_query.answer()
 
 # Обработчик крутки слотов
 async def slots_spin_handler(callback_query: types.CallbackQuery):
@@ -3651,8 +3427,51 @@ async def slots_spin_handler(callback_query: types.CallbackQuery):
     else:
         print("Группа для результатов не установлена")
 
-    # Показываем результат мгновенно
-    final_result = f"🎰 | {result[0]} | {result[1]} | {result[2]} |\n\n{result_text}"
+    # Красивая анимация слотов с тремя барабанами
+    if win_chance:
+        # Анимация для выигрыша
+        slots_frames = [
+            "🎰 Кручу барабаны...\n❓ ❓ ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Первый барабан...\n🍒 ❓ ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Второй барабан...\n🍒 🍋 ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Третий барабан...\n🍒 🍋 🍊\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Остановка...\n🍒 🍋 🍊\n🍇 ❓ ❓\n❓ ❓ ❓",
+            "🎰 Почти готово...\n🍒 🍋 🍊\n🍇 🔔 ❓\n❓ ❓ ❓",
+            "🎰 ДЖЕКПОТ!\n🍒 🍋 🍊\n🍇 🔔 💎\n7️⃣ ❓ ❓",
+            f"🎰 ДЖЕКПОТ!\n{result[0]} {result[1]} {result[2]}\n\n{result_text}"
+        ]
+    else:
+        # Анимация для проигрыша
+        slots_frames = [
+            "🎰 Кручу барабаны...\n❓ ❓ ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Первый барабан...\n🍒 ❓ ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Второй барабан...\n🍒 🔔 ❓\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Третий барабан...\n🍒 🔔 🍇\n❓ ❓ ❓\n❓ ❓ ❓",
+            "🎰 Остановка...\n🍒 🔔 🍇\n🍋 ❓ ❓\n❓ ❓ ❓",
+            "🎰 Почти готово...\n🍒 🔔 🍇\n🍋 🍊 ❓\n❓ ❓ ❓",
+            "🎰 Результат...\n🍒 🔔 🍇\n🍋 🍊 🟡\n💎 ❓ ❓",
+            f"🎰 ИГРАТЬ ЕЩЕ!\n{result[0]} {result[1]} {result[2]}\n\n{result_text}"
+        ]
+
+    for i, frame in enumerate(slots_frames[:-1]):
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+        if i < 3:  # Быстрее на старте
+            await asyncio.sleep(0.5)
+        else:  # Медленнее в конце
+            await asyncio.sleep(0.8)
+
+    # Финальный результат
+    final_result = slots_frames[-1]
 
     # Клавиатура для итогов
     result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -3660,11 +3479,10 @@ async def slots_spin_handler(callback_query: types.CallbackQuery):
         [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
     ])
 
-    # Финальное сообщение
+    # Финальное сообщение с правильным изображением
     photo_url = WIN_IMAGE_URL if win_chance else LOSE_IMAGE_URL
-    final_caption = f"🎰 <b>РЕЗУЛЬТАТ:</b>\n\n{final_result}"
     try:
-        media = InputMediaPhoto(media=photo_url, caption=final_caption, parse_mode="HTML")
+        media = InputMediaPhoto(media=photo_url, caption=final_result, parse_mode="HTML")
         await bot.edit_message_media(
             chat_id=callback_query.message.chat.id,
             message_id=callback_query.message.message_id,
@@ -3672,7 +3490,7 @@ async def slots_spin_handler(callback_query: types.CallbackQuery):
             reply_markup=result_keyboard
         )
     except:
-        await callback_query.message.answer_photo(photo=photo_url, caption=final_caption, reply_markup=result_keyboard, parse_mode="HTML")
+        await callback_query.message.answer_photo(photo=photo_url, caption=final_result, reply_markup=result_keyboard, parse_mode="HTML")
 
     await callback_query.answer()
 
@@ -3766,6 +3584,473 @@ async def dice_bet_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
 
+
+
+# Обработчик ввода количества билетов в лотерею
+async def lottery_ticket_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        ticket_count = int(message.text.strip())
+        if ticket_count < 1 or ticket_count > 10:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка количества
+
+Введите от 1 до 10 билетов"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+        total_cost = ticket_count * 1  # 1$ за билет
+
+        if total_cost > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        # Показываем генерацию номеров
+        numbers_text = f"""💎 Баланс: {balance - total_cost}$
+
+🎲 Лотерея
+
+🎫 Куплено билетов: {ticket_count}
+💰 Стоимость: {total_cost}$
+
+🎰 Генерация номеров..."""
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=numbers_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=numbers_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        # Анимация генерации номеров лотереи
+        lottery_frames = [
+            "🎰 Генерация номеров...\n🎫 [□□□□□□□□□□]\n     🎲",
+            "🎰 Выбор чисел...\n🎫 [■■□□□□□□□□]\n   🎲   🎲",
+            "🎰 Случайные числа...\n🎫 [■■■■□□□□□□]\n 🎲   🎲   🎲",
+            "🎰 Уникальные номера...\n🎫 [■■■■■■□□□□]\n🎲   🎲   🎲   🎲",
+            "🎰 Проверка билетов...\n🎫 [■■■■■■■■□□]\n 🎲   🎲   🎲   🎲",
+            "🎰 Финальная проверка...\n🎫 [■■■■■■■■■■]\n🎲   🎲   🎲   🎲   🎲",
+            "🎰 Ваши билеты готовы!\n🎫 [██████████]\n     ✨ ГОТОВО! ✨"
+        ]
+
+        for frame in lottery_frames:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except:
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+            await asyncio.sleep(0.6)  # Задержка между кадрами
+
+        # Получаем данные пользователя для сохранения в БД
+        user_data = await async_get_user(message.from_user.id)
+        user_id = user_data[0] if user_data else None
+
+        # Получаем текущий розыгрыш лотереи
+        current_draw = await async_db.get_current_lottery_draw()
+
+        if not current_draw:
+            # Если нет активного розыгрыша, создаем новый
+            # Получаем следующий номер розыгрыша
+            last_draw = await async_db.get_lottery_draw_by_number(999999)  # Ищем самый большой номер
+            next_draw_number = 1 if not last_draw else last_draw[1] + 1
+            await async_db.create_lottery_draw(next_draw_number)
+            current_draw = await async_db.get_current_lottery_draw()
+
+        if not current_draw:
+            await message.answer("❌ Ошибка создания розыгрыша лотереи", reply_markup=get_back_button())
+            await state.clear()
+            return
+
+        draw_number = current_draw[1]  # draw_number
+
+        # Генерируем случайные номера
+        lottery_numbers = random.sample(range(1, 51), ticket_count)
+
+        # Списываем средства
+        await async_update_balance(message.from_user.id, -total_cost)
+        await invalidate_balance_cache(message.from_user.id)
+
+        # Сохраняем билеты в базу данных
+        ticket_numbers_str = ','.join(map(str, lottery_numbers))
+        await async_db.purchase_lottery_tickets(user_id, message.from_user.id, draw_number, ticket_numbers_str)
+
+        # Логируем покупку билетов
+        await async_log_action(message.from_user.id, "lottery_ticket_purchase", total_cost, f"Куплено {ticket_count} билетов для розыгрыша #{draw_number}")
+
+        # Показываем номера
+        numbers_display = "\n".join([f"🎫 Билет {i+1}: {', '.join(map(str, lottery_numbers[i*5:(i+1)*5]))}" for i in range((len(lottery_numbers) + 4) // 5)])
+
+        result_text = f"""💎 Баланс: {balance - total_cost}$
+
+🎲 Лотерея - Ваши номера
+
+{numbers_display}
+
+⏰ Розыгрыш: каждый час
+🏆 Приз: до x{LOTTERY_MULTIPLIER}"""
+
+        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Купить еще", callback_data="game_lottery")],
+            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=result_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=result_keyboard
+            )
+        except:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=result_text, reply_markup=result_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректное число билетов (1-10)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+# Обработчик ввода ставки в колесо фортуны
+async def wheel_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()  # Очищаем состояние при недостатке средств
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        # Показываем подтверждение ставки с кнопкой "Крутить"
+        confirm_text = f"""💎 Баланс: {balance - bet}$
+
+🎡 Колесо фортуны <a href="{WHEEL_FAQ_URL}">faq</a>
+
+♻️ Средний множитель: x{WHEEL_MULTIPLIER}
+💰 Ставка: {bet}$
+
+🎯 Готовы крутить колесо?"""
+
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎡 Крутить колесо", callback_data=f"wheel_spin_{bet}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="game_wheel")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=confirm_keyboard
+            )
+        except:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+        await state.clear()
+        return
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=wheel_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=wheel_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        # Определяем результат заранее
+        wheel_segments = [
+            "x2", "x0", "x5", "💎 Джекпот", "🎁 Бонус",
+            "x2", "x0", "x10", "x3", "x0",
+            "x2", "x5", "x0", "🎁 Бонус", "x2"
+        ]
+
+        # Rigged логика с учетом реальных шансов сегментов
+        win_chance = random.random() < (WHEEL_WIN_CHANCE / 100)
+
+        # Инициализируем result_segment
+        result_segment = "x0"  # По умолчанию проигрыш
+
+        if win_chance:
+            # Выбираем выигрышный сегмент с учетом их реальных шансов
+            # Создаем взвешенный список сегментов
+            weighted_segments = []
+            for segment in wheel_segments:
+                if segment == "x0":
+                    continue  # Пропускаем проигрышные сегменты
+                elif segment == "x2":
+                    weighted_segments.extend([segment] * 4)  # 4 раза (26.7%)
+                elif segment == "x5":
+                    weighted_segments.extend([segment] * 2)  # 2 раза (13.3%)
+                elif segment == "💎 Джекпот":
+                    weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+                elif segment == "🎁 Бонус":
+                    weighted_segments.extend([segment] * 2)  # 2 раза (13.3%)
+                elif segment == "x10":
+                    weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+                elif segment == "x3":
+                    weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+
+            if weighted_segments:  # Проверяем, что есть выигрышные сегменты
+                result_segment = random.choice(weighted_segments)
+        else:
+            # Выбираем проигрышный сегмент
+            losing_segments = [s for s in wheel_segments if s == "x0"]
+            if losing_segments:  # Проверяем, что есть проигрышные сегменты
+                result_segment = random.choice(losing_segments)
+
+        # Улучшенная анимация колеса фортуны с секторами
+        animation_frames = [
+            "🎡 Запуск колеса...\n     🎯\n  🎪     🎨\n🎭         🎪\n  🎨     🎭\n     🎯",
+            "🎡 Вращение...\n     🎨\n  🎭     🎯\n🎪         🎨\n  🎯     🎪\n     🎭",
+            "🎡 Ускорение...\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎪     🎯\n     🎨",
+            "🎡 Максимум...\n     🎯\n  🎨     🎭\n🎭         🎯\n  🎨     🎪\n     🎭",
+            "🎡 Замедление...\n     🎨\n  🎭     🎯\n🎯         🎨\n  🎭     🎪\n     🎯",
+            "🎡 Почти...\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎯     🎪\n     🎨",
+            "🎡 Стоп!\n     🎯\n  🎨     🎭\n🎭         🎯\n  🎨     🎪\n     🎭",
+            f"🎡 РЕЗУЛЬТАТ!\n     🎨\n  🎭     🎯\n🎯         🎨\n  🎭     🎪\n     🎯",
+            f"🎡 СЕКТОР: {result_segment}\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎯     🎪\n     🎨"
+        ]
+
+        for frame in animation_frames:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except:
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+            await asyncio.sleep(0.8)  # Задержка между кадрами
+
+
+        # Увеличиваем счетчик игр
+        await async_update_games_played(message.from_user.id)
+
+        # Определяем результат
+        if result_segment == "x0":
+            # Проигрыш
+            await async_update_balance(message.from_user.id, -bet)
+            await invalidate_balance_cache(message.from_user.id)
+            result_text = f"😞 Вы проиграли! -{bet}$"
+            winnings = -bet
+        elif result_segment == "💎 Джекпот":
+            # Джекпот - используем WHEEL_MULTIPLIER из конфига
+            winnings = bet * WHEEL_MULTIPLIER
+            await async_update_balance(message.from_user.id, winnings)
+            await invalidate_balance_cache(message.from_user.id)
+            result_text = f"🎉 ДЖЕКПОТ x{WHEEL_MULTIPLIER}! +{winnings}$"
+        elif result_segment == "🎁 Бонус":
+            # Бонус - возврат ставки
+            result_text = f"🎁 Бонус! Ставка возвращена"
+            winnings = 0
+        else:
+            # Множитель
+            multiplier = float(result_segment.replace("x", ""))
+            winnings = bet * multiplier
+            await async_update_balance(message.from_user.id, winnings)
+            await invalidate_balance_cache(message.from_user.id)
+            result_text = f"🎉 Выигрыш x{multiplier}! +{winnings}$"
+
+        # Отправить результат в группу
+        if results_group_id:
+            try:
+                username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name or "Неизвестно"
+                if winnings > 0:
+                    winnings_label = "Выигрыш"
+                    group_result = f"✅ Выигрыш! +{winnings}$"
+                elif winnings < 0:
+                    winnings_label = "Проигрыш"
+                    group_result = f"❌ Проигрыш! -{bet}$"
+                else:
+                    winnings_label = "Возврат"
+                    group_result = "🎁 Бонус! Ставка возвращена"
+
+                group_text = f"""📎 Игра: Колесо фортуны
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_segment} - {group_result}
+💲 {winnings_label}: {winnings if winnings != 0 else bet}$"""
+                photo_url = WIN_IMAGE_URL if winnings >= 0 else LOSE_IMAGE_URL
+                await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+            except Exception as e:
+                print(f"Ошибка отправки в группу: {e}")
+
+        # Финальный результат с правильным заголовком
+        if winnings > 0:
+            final_text = f"""💎 Баланс: {balance - bet + winnings}
+
+🎡 Колесо фортуны
+
+🎯 Результат: {result_segment}
+
+{result_text}"""
+        elif winnings == 0:
+            final_text = f"""💎 Баланс: {balance - bet}
+
+🎡 Колесо фортуны
+
+🎯 Результат: {result_segment}
+
+{result_text}"""
+        else:
+            final_text = f"""💎 Баланс: {balance - bet + bet}
+
+🎡 Колесо фортуны
+
+🎯 Результат: {result_segment}
+
+{result_text}"""
+
+        result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎡 Крутить еще", callback_data="game_wheel")],
+            [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+        ])
+
+        photo_url = WIN_IMAGE_URL if winnings >= 0 else LOSE_IMAGE_URL
+        try:
+            media = InputMediaPhoto(media=photo_url, caption=final_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=result_keyboard
+            )
+        except:
+            await message.answer_photo(photo=photo_url, caption=final_text, reply_markup=result_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
 # Обработчик подтверждения дуэли
 async def duel_confirm_handler(callback_query: types.CallbackQuery):
     data = callback_query.data.split("_")
@@ -3849,11 +4134,32 @@ async def duel_confirm_handler(callback_query: types.CallbackQuery):
     else:
         print("Группа для результатов не установлена")
 
-    # Текст с кубиками
-    game_text = f"""🎲 Ваш кубик: {user_dice}
-🎲 Кубик бота: {bot_dice}
+    # Красивая анимация броска двух кубиков
+    dice_frames = [
+        "🎲 Бросок кубиков...\n🎲 ❓   🎲 ❓",
+        "🎲 Кубики в полете...\n🎲 ↗️   🎲 ↙️",
+        "🎲 Перевороты в воздухе...\n🎲 🔄   🎲 🔄",
+        "🎲 Приземление...\n🎲 💫   🎲 💫",
+        "🎲 Результат!\n🎲 ✨   🎲 ✨",
+        f"🎲 ФИНАЛ!\n🎲 {user_dice}   🎲 {bot_dice}\n\n{result_text}"
+    ]
 
-{result_text}"""
+    for i, frame in enumerate(dice_frames[:-1]):
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+        await asyncio.sleep(0.7 + i * 0.2)  # Увеличиваем задержку
+
+    # Финальный результат
+    game_text = dice_frames[-1]
 
     # Клавиатура для итогов
     result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -4924,11 +5230,32 @@ async def dice_color_handler(callback_query: types.CallbackQuery):
     else:
         print("Группа для результатов не установлена")
 
-    # Текст с Кубикиом
-    game_text = f"""🎲 Верный Кубики: {result_color_text}
-♻️ Вы выбрали: {chosen_color_text}
+    # Красивая анимация Кубикиа с выбором цвета
+    dice_frames = [
+        f"🎲 Выбор цвета...\n🎲 {chosen_color_text}\n     🎯",
+        "🎲 Подготовка кубика...\n🎲 ⚪ → 🔴\n     🎲",
+        "🎲 Насыщение цветом...\n🎲 🔴 → 🟡\n     🎲",
+        f"🎲 Ваш кубик готов!\n🎲 {result_color_text}\n     ✨",
+        f"🎲 Бросок цветного кубика!\n🎲 {result_color_text}\n     🎲",
+        f"🎲 ФИНАЛ!\n🎲 {result_color_text}\n\nВы выбрали: {chosen_color_text}\n\n{result_text}"
+    ]
 
-{result_text}"""
+    for i, frame in enumerate(dice_frames[:-1]):
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+        await asyncio.sleep(0.8 + i * 0.3)
+
+    # Финальный результат
+    game_text = dice_frames[-1]
 
     # Клавиатура для итогов
     result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -4950,6 +5277,360 @@ async def dice_color_handler(callback_query: types.CallbackQuery):
         await callback_query.message.answer_photo(photo=photo_url, caption=game_text, reply_markup=result_keyboard)
 
     await callback_query.answer()
+
+# Обработчик вращения рулетки
+async def wheel_spin_handler(callback_query: types.CallbackQuery):
+    """Обработчик кнопки 'Крутить колесо'"""
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+
+    user = callback_query.from_user
+
+    print(f"Начало вращения колеса: user={user.id}, bet={bet}")
+
+    # Красивая анимация вращения колеса
+    wheel_text = f"""💎 Баланс: {bet}$ списано
+
+🎡 Колесо фортуны
+
+💰 Ставка: {bet}$
+
+🎡 Запуск колеса..."""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=wheel_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=wheel_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    # Определяем результат заранее
+    wheel_segments = [
+        "x2", "x0", "x5", "💎 Джекпот", "🎁 Бонус",
+        "x2", "x0", "x10", "x3", "x0",
+        "x2", "x5", "x0", "🎁 Бонус", "x2"
+    ]
+
+    # Rigged логика с учетом реальных шансов сегментов
+    win_chance = random.random() < (WHEEL_WIN_CHANCE / 100)
+
+    # Инициализируем result_segment
+    result_segment = "x0"  # По умолчанию проигрыш
+
+    if win_chance:
+        # Выбираем выигрышный сегмент с учетом их реальных шансов
+        # Создаем взвешенный список сегментов
+        weighted_segments = []
+        for segment in wheel_segments:
+            if segment == "x0":
+                continue  # Пропускаем проигрышные сегменты
+            elif segment == "x2":
+                weighted_segments.extend([segment] * 4)  # 4 раза (26.7%)
+            elif segment == "x5":
+                weighted_segments.extend([segment] * 2)  # 2 раза (13.3%)
+            elif segment == "💎 Джекпот":
+                weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+            elif segment == "🎁 Бонус":
+                weighted_segments.extend([segment] * 2)  # 2 раза (13.3%)
+            elif segment == "x10":
+                weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+            elif segment == "x3":
+                weighted_segments.extend([segment] * 1)  # 1 раз (6.7%)
+
+        if weighted_segments:  # Проверяем, что есть выигрышные сегменты
+            result_segment = random.choice(weighted_segments)
+    else:
+        # Выбираем проигрышный сегмент
+        losing_segments = [s for s in wheel_segments if s == "x0"]
+        if losing_segments:  # Проверяем, что есть проигрышные сегменты
+            result_segment = random.choice(losing_segments)
+
+    # Улучшенная анимация колеса фортуны с секторами
+    animation_frames = [
+        "🎡 Запуск колеса...\n     🎯\n  🎪     🎨\n🎭         🎪\n  🎨     🎭\n     🎯",
+        "🎡 Вращение...\n     🎨\n  🎭     🎯\n🎪         🎨\n  🎯     🎪\n     🎭",
+        "🎡 Ускорение...\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎪     🎯\n     🎨",
+        "🎡 Максимум...\n     🎯\n  🎨     🎭\n🎭         🎯\n  🎨     🎪\n     🎭",
+        "🎡 Замедление...\n     🎨\n  🎭     🎯\n🎯         🎨\n  🎭     🎪\n     🎯",
+        "🎡 Почти...\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎯     🎪\n     🎨",
+        "🎡 Стоп!\n     🎯\n  🎨     🎭\n🎭         🎯\n  🎨     🎪\n     🎭",
+        f"🎡 РЕЗУЛЬТАТ!\n     🎨\n  🎭     🎯\n🎯         🎨\n  🎭     🎪\n     🎯",
+        f"🎡 СЕКТОР: {result_segment}\n     🎭\n  🎯     🎨\n🎨         🎭\n  🎯     🎪\n     🎨"
+    ]
+
+    for frame in animation_frames:
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=frame, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                media=media,
+                reply_markup=get_back_button()
+            )
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=frame, reply_markup=get_back_button(), parse_mode="HTML")
+
+        await asyncio.sleep(0.8)  # Задержка между кадрами
+
+    # Увеличиваем счетчик игр
+    await async_update_games_played(user.id)
+
+    # Определяем результат
+    if result_segment == "x0":
+        # Проигрыш
+        await async_update_balance(user.id, -bet)
+        await invalidate_balance_cache(user.id)
+        result_text = f"😞 Вы проиграли! -{bet}$"
+        winnings = -bet
+    elif result_segment == "💎 Джекпот":
+        # Джекпот - используем WHEEL_MULTIPLIER из конфига
+        winnings = bet * WHEEL_MULTIPLIER
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 ДЖЕКПОТ x{WHEEL_MULTIPLIER}! +{winnings}$"
+    elif result_segment == "🎁 Бонус":
+        # Бонус - возврат ставки
+        result_text = f"🎁 Бонус! Ставка возвращена"
+        winnings = 0
+    else:
+        # Множитель
+        multiplier = float(result_segment.replace("x", ""))
+        winnings = bet * multiplier
+        await async_update_balance(user.id, winnings)
+        await invalidate_balance_cache(user.id)
+        result_text = f"🎉 Выигрыш x{multiplier}! +{winnings}$"
+
+    # Отправить результат в группу
+    if results_group_id:
+        try:
+            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+            if winnings > 0:
+                winnings_label = "Выигрыш"
+                group_result = f"✅ Выигрыш! +{winnings}$"
+            elif winnings < 0:
+                winnings_label = "Проигрыш"
+                group_result = f"❌ Проигрыш! -{bet}$"
+            else:
+                winnings_label = "Возврат"
+                group_result = "🎁 Бонус! Ставка возвращена"
+
+            group_text = f"""📎 Игра: Колесо фортуны
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_segment} - {group_result}
+💲 {winnings_label}: {winnings if winnings != 0 else bet}$"""
+            photo_url = WIN_IMAGE_URL if winnings >= 0 else LOSE_IMAGE_URL
+            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
+        except Exception as e:
+            print(f"Ошибка отправки в группу: {e}")
+
+    # Финальный результат
+    final_text = f"""🎡 Колесо фортуны
+
+🎯 Результат: {result_segment}
+
+{result_text}"""
+
+    result_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎡 Крутить еще", callback_data="game_wheel")],
+        [InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")]
+    ])
+
+    photo_url = WIN_IMAGE_URL if winnings >= 0 else LOSE_IMAGE_URL
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=final_text, parse_mode="HTML")
+        await bot.edit_message_media(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            media=media,
+            reply_markup=result_keyboard
+        )
+    except:
+        await callback_query.message.answer_photo(photo=photo_url, caption=final_text, reply_markup=result_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+
+# Планировщик лотереи - проверяет каждый час необходимость проведения розыгрыша
+async def lottery_scheduler():
+    """Планировщик розыгрышей лотереи"""
+    while True:
+        try:
+            # Получаем текущий активный розыгрыш
+            current_draw = await async_db.get_current_lottery_draw()
+
+            if current_draw:
+                draw_id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool = current_draw
+
+                # Проверяем, наступило ли время розыгрыша
+                from datetime import datetime
+                try:
+                    draw_datetime = datetime.fromisoformat(draw_date.replace('Z', '+00:00'))
+                    current_datetime = datetime.now(draw_datetime.tzinfo)
+
+                    if current_datetime >= draw_datetime and status == 'active':
+                        print(f"⏰ Время розыгрыша лотереи #{draw_number} наступило!")
+
+                        # Проверяем, есть ли минимум 5 участников
+                        tickets = await async_db.get_all_tickets_for_draw(draw_number)
+                        unique_participants = len(set(ticket[2] for ticket in tickets))  # telegram_id уникальных участников
+
+                        if unique_participants >= 5:
+                            print(f"✅ В лотерее #{draw_number} участвует {unique_participants} человек - проводим розыгрыш!")
+                            await conduct_lottery_draw()
+
+                            # Создаем следующий розыгрыш
+                            next_draw_number = draw_number + 1
+                            await async_db.create_lottery_draw(next_draw_number)
+                            print(f"🎫 Создан следующий розыгрыш лотереи #{next_draw_number}")
+                        else:
+                            print(f"⏳ В лотерее #{draw_number} только {unique_participants} участников. Ждем еще людей (нужно минимум 5)")
+                            # Продлеваем розыгрыш на 1 час
+                            new_draw_time = current_datetime + timedelta(hours=1)
+                            await asyncio.to_thread(async_db._execute_query,
+                                "UPDATE lottery_draws SET draw_date = ? WHERE draw_number = ?",
+                                (new_draw_time.isoformat(), draw_number), commit=True)
+                            print(f"⏰ Розыгрыш #{draw_number} продлен до {new_draw_time}")
+                except Exception as e:
+                    print(f"❌ Ошибка проверки времени розыгрыша: {e}")
+            else:
+                # Если нет активного розыгрыша, создаем первый
+                print("🎫 Создаем первый розыгрыш лотереи")
+                await async_db.create_lottery_draw(1)
+
+        except Exception as e:
+            print(f"❌ Ошибка в планировщике лотереи: {e}")
+
+        # Ждем 60 секунд перед следующей проверкой
+        await asyncio.sleep(60)
+
+# Функция проведения розыгрыша лотереи
+async def conduct_lottery_draw():
+    """Проведение розыгрыша лотереи"""
+    try:
+        # Получаем текущий активный розыгрыш
+        current_draw = await async_db.get_current_lottery_draw()
+
+        if not current_draw:
+            print("❌ Нет активного розыгрыша лотереи")
+            return
+
+        draw_id, draw_number, winning_numbers, draw_date, status, total_tickets, total_prize_pool = current_draw
+
+        if status != 'active':
+            print(f"❌ Розыгрыш #{draw_number} уже завершен")
+            return
+
+        print(f"🎲 Начинаем розыгрыш лотереи #{draw_number}")
+
+        # Получаем все билеты для этого розыгрыша
+        tickets = await async_db.get_all_tickets_for_draw(draw_number)
+
+        if not tickets:
+            print(f"❌ Нет билетов для розыгрыша #{draw_number}")
+            # Завершаем розыгрыш без победителей
+            await async_db.update_lottery_draw_winning_numbers(draw_number, "Нет билетов")
+            return
+
+        # Генерируем выигрышные номера (6 уникальных чисел от 1 до 50)
+        winning_numbers_list = random.sample(range(1, 51), 6)
+        winning_numbers_str = ','.join(map(str, sorted(winning_numbers_list)))
+
+        print(f"🎯 Выигрышные номера: {winning_numbers_str}")
+
+        # Обновляем розыгрыш с выигрышными номерами
+        await async_db.update_lottery_draw_winning_numbers(draw_number, winning_numbers_str)
+
+        # Обновляем статистику розыгрыша
+        total_tickets_count = len(tickets)
+        total_prize_pool_amount = total_tickets_count * 1  # 1$ за билет
+        await async_db.update_lottery_draw_stats(draw_number, total_tickets_count, total_prize_pool_amount)
+
+        # Проверяем билеты на выигрыш
+        winners = []
+        for ticket in tickets:
+            ticket_id, user_id, telegram_id, ticket_numbers_str = ticket
+            ticket_numbers = [int(num) for num in ticket_numbers_str.split(',')]
+
+            # Проверяем, совпадают ли номера (проверяем все 6 номеров)
+            matches = set(ticket_numbers) & set(winning_numbers_list)
+            if len(matches) >= 3:  # Минимум 3 совпадения для выигрыша
+                # Определяем размер выигрыша в зависимости от количества совпадений
+                if len(matches) == 6:
+                    winnings = total_prize_pool_amount * 0.5  # 50% от призового фонда за 6 номеров
+                elif len(matches) == 5:
+                    winnings = total_prize_pool_amount * 0.3  # 30% от призового фонда за 5 номеров
+                elif len(matches) == 4:
+                    winnings = total_prize_pool_amount * 0.15  # 15% от призового фонда за 4 номера
+                else:  # 3 номера
+                    winnings = total_prize_pool_amount * 0.05  # 5% от призового фонда за 3 номера
+
+                # Отмечаем билет как выигрышный
+                await async_db.mark_ticket_as_winner(ticket_id, winnings)
+
+                # Начисляем выигрыш пользователю
+                await async_update_balance(telegram_id, winnings)
+                await invalidate_balance_cache(telegram_id)
+
+                # Логируем выигрыш
+                await async_log_action(telegram_id, "lottery_win", winnings, f"Выигрыш в лотерее #{draw_number}: {len(matches)} совпадений")
+
+                winners.append({
+                    'telegram_id': telegram_id,
+                    'ticket_numbers': ticket_numbers_str,
+                    'matches': len(matches),
+                    'winnings': winnings
+                })
+
+                print(f"🏆 Победитель: telegram_id={telegram_id}, совпадений={len(matches)}, выигрыш={winnings}$")
+
+        print(f"✅ Розыгрыш #{draw_number} завершен. Победителей: {len(winners)}")
+
+        # Отправляем уведомления победителям
+        if winners:
+            for winner in winners:
+                try:
+                    winner_text = f"""🎉 <b>ПОЗДРАВЛЯЕМ! ВЫ ВЫИГРАЛИ В ЛОТЕРЕЕ!</b>
+
+🎲 Розыгрыш #{draw_number}
+🎯 Выигрышные номера: {winning_numbers_str}
+🎫 Ваши номера: {winner['ticket_numbers']}
+✅ Совпадений: {winner['matches']}
+💰 Выигрыш: {winner['winnings']}$"""
+
+                    await bot.send_message(
+                        chat_id=winner['telegram_id'],
+                        text=winner_text,
+                        parse_mode="HTML"
+                    )
+                    print(f"📨 Уведомление отправлено победителю {winner['telegram_id']}")
+                except Exception as e:
+                    print(f"❌ Ошибка отправки уведомления победителю {winner['telegram_id']}: {e}")
+
+        # Отправляем уведомление в группу результатов
+        if results_group_id:
+            try:
+                result_text = f"""🎲 <b>РЕЗУЛЬТАТЫ ЛОТЕРЕИ #{draw_number}</b>
+
+🎯 Выигрышные номера: <code>{winning_numbers_str}</code>
+🎫 Всего билетов: <code>{total_tickets_count}</code>
+👑 Победителей: <code>{len(winners)}</code>
+💰 Общий призовой фонд: <code>{total_prize_pool_amount}$</code>
+
+{'🏆 Есть победители!' if winners else '😔 Победителей нет'}"""
+
+                await bot.send_message(
+                    chat_id=results_group_id,
+                    text=result_text,
+                    parse_mode="HTML"
+                )
+                print("📊 Результаты лотереи отправлены в группу")
+            except Exception as e:
+                print(f"❌ Ошибка отправки результатов в группу: {e}")
+
+    except Exception as e:
+        print(f"❌ Ошибка проведения розыгрыша лотереи: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Обработчик ввода кода промокода
 async def promo_code_handler(message: types.Message, state: FSMContext):
@@ -5063,8 +5744,7 @@ async def promo_code_handler(message: types.Message, state: FSMContext):
 async def game_placeholder_handler(callback_query: types.CallbackQuery):
     game = callback_query.data.split("_")[1]
     game_names = {
-        "dice": "Кубики",
-        "darts": "Дартс"
+        "dice": "Кубики"
     }
     game_name = game_names.get(game, game.capitalize())
     await callback_query.answer(f"🎮 {game_name} в разработке", show_alert=True)
@@ -5101,6 +5781,7 @@ def setup_handlers():
         dp.callback_query.register(rating_handler, F.data == "rating")
         dp.callback_query.register(chances_handler, F.data == "chances")
         dp.callback_query.register(admin_panel_handler, F.data == "admin_panel")
+        dp.callback_query.register(admin_all_chances_handler, F.data == "admin_all_chances")
         dp.callback_query.register(admin_chances_handler, F.data == "admin_chances")
         dp.callback_query.register(admin_multiplier_handler, F.data == "admin_multiplier")
         dp.callback_query.register(admin_stats_handler, F.data == "admin_stats")
@@ -5109,23 +5790,21 @@ def setup_handlers():
         dp.callback_query.register(edit_chance_dice_handler, F.data == "edit_chance_dice")
         dp.callback_query.register(edit_chance_basketball_handler, F.data == "edit_chance_basketball")
         dp.callback_query.register(edit_chance_slots_handler, F.data == "edit_chance_slots")
-        dp.callback_query.register(edit_chance_blackjack_handler, F.data == "edit_chance_blackjack")
         dp.callback_query.register(edit_multiplier_duel_handler, F.data == "edit_multiplier_duel")
         dp.callback_query.register(edit_multiplier_basketball_handler, F.data == "edit_multiplier_basketball")
         dp.callback_query.register(edit_multiplier_slots_handler, F.data == "edit_multiplier_slots")
         dp.callback_query.register(edit_multiplier_dice_handler, F.data == "edit_multiplier_dice")
-        dp.callback_query.register(edit_multiplier_blackjack_handler, F.data == "edit_multiplier_blackjack")
         dp.callback_query.register(duel_handler, F.data == "game_duel")
         dp.callback_query.register(dice_handler, F.data == "game_dice")
         dp.callback_query.register(dice_color_handler, F.data.startswith("dice_color_"))
         dp.callback_query.register(basketball_handler, F.data == "game_basketball")
         dp.callback_query.register(basketball_predict_hit_handler, F.data.startswith("basketball_predict_hit_"))
         dp.callback_query.register(slots_handler, F.data == "game_slots")
-        dp.callback_query.register(blackjack_handler, F.data == "game_blackjack")
         dp.callback_query.register(slots_spin_handler, F.data.startswith("slots_spin_"))
-        dp.callback_query.register(blackjack_hit_handler, F.data.startswith("blackjack_hit_"))
-        dp.callback_query.register(blackjack_stand_handler, F.data.startswith("blackjack_stand_"))
-        dp.callback_query.register(game_placeholder_handler, F.data.startswith("game_") & ~F.data.in_(["game_duel", "game_dice", "game_slots", "game_basketball", "game_blackjack"]))
+        dp.callback_query.register(lottery_handler, F.data == "game_lottery")
+        dp.callback_query.register(wheel_handler, F.data == "game_wheel")
+        dp.callback_query.register(wheel_spin_handler, F.data.startswith("wheel_spin_"))
+        dp.callback_query.register(game_placeholder_handler, F.data.startswith("game_") & ~F.data.in_(["game_duel", "game_dice", "game_slots", "game_basketball", "game_lottery", "game_wheel"]))
         dp.callback_query.register(duel_confirm_handler, F.data.startswith("duel_confirm_"))
         dp.callback_query.register(withdraw_referral_handler, F.data == "withdraw_referral")
         dp.callback_query.register(deposit_handler, F.data == "deposit")
@@ -5147,7 +5826,7 @@ def setup_handlers():
         dp.callback_query.register(change_avatar_handler, F.data == "change_avatar")
         dp.callback_query.register(progress_charts_handler, F.data == "progress_charts")
 
-        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_chance_blackjack", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "edit_multiplier_blackjack", "game_duel", "game_dice", "game_basketball", "game_slots", "game_blackjack", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts"]))
+        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "game_duel", "game_dice", "game_basketball", "game_slots", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts"]))
 
         # Обработчик ввода суммы
         dp.message.register(process_custom_amount, DepositStates.waiting_for_amount)
@@ -5161,24 +5840,23 @@ def setup_handlers():
         # Обработчик ввода ставки в слоты
         dp.message.register(slots_bet_handler, SlotsStates.waiting_for_bet)
 
-        # Обработчик ввода ставки в blackjack
-        dp.message.register(blackjack_bet_handler, BlackjackStates.waiting_for_bet)
-
-        # Обработчик ввода ставки в Кубикие
+        # Обработчик ввода ставки в Кубики
         dp.message.register(dice_bet_handler, DiceStates.waiting_for_bet)
+
+        # Обработчики для новых игр
+        dp.message.register(wheel_bet_handler, WheelStates.waiting_for_bet)
+        dp.message.register(lottery_ticket_handler, LotteryStates.waiting_for_ticket_count)
 
         # Обработчики ввода шансов для админов
         dp.message.register(set_duel_chance_handler, AdminStates.waiting_for_duel_chance)
         dp.message.register(set_basketball_chance_handler, AdminStates.waiting_for_basketball_chance)
         dp.message.register(set_slots_chance_handler, AdminStates.waiting_for_slots_chance)
-        dp.message.register(set_blackjack_chance_handler, AdminStates.waiting_for_blackjack_chance)
         dp.message.register(set_dice_chance_handler, AdminStates.waiting_for_dice_chance)
 
         # Обработчики ввода множителей для админов
         dp.message.register(set_duel_multiplier_handler, AdminStates.waiting_for_duel_multiplier)
         dp.message.register(set_basketball_multiplier_handler, AdminStates.waiting_for_basketball_multiplier)
         dp.message.register(set_slots_multiplier_handler, AdminStates.waiting_for_slots_multiplier)
-        dp.message.register(set_blackjack_multiplier_handler, AdminStates.waiting_for_blackjack_multiplier)
         dp.message.register(set_dice_multiplier_handler, AdminStates.waiting_for_dice_multiplier)
 
         # Обработчики вывода средств

@@ -1,5 +1,5 @@
 # Токены ботов
-TELEGRAM_TOKEN = "8385343502:AAFxLxYG5OcrhdMlWJgIkZGZcf8zCyoTejY"
+TELEGRAM_TOKEN = "8398207757:AAHqH5mZSwL7rxx6FGZFu-0ZzfIHQ00_I7M"
 CRYPTO_BOT_TOKEN = "458530:AA2k6GJxJ6VXSa13SjZIVFziqJL4Sgg0oe3"
 
 # API URLs
@@ -28,8 +28,8 @@ DUEL_FAQ_URL = "https://t.me/VanishCasino/10"  # Замените на ссыл�
 DICE_FAQ_URL = "https://t.me/VanishCasino/11"  # Замените на ссылку для кубиков
 BASKETBALL_FAQ_URL = "https://t.me/VanishCasino/12"  # Замените на ссылку для баскетбола
 SLOTS_FAQ_URL = "https://t.me/VanishCasino/13"  # Замените на ссылку для слотов
-BLACKJACK_FAQ_URL = "https://t.me/VanishCasino/14"  # Замените на ссылку для blackjack
-DARTS_FAQ_URL = "https://example.com/darts-faq"  # Замените на ссылку для дартс
+LOTTERY_FAQ_URL = "https://t.me/VanishCasino/15"  # FAQ для лотереи
+WHEEL_FAQ_URL = "https://t.me/VanishCasino/16"  # FAQ для колеса фортуны
 
 # Ссылки на группы
 GROUPS = [
@@ -67,14 +67,16 @@ DEFAULT_GAME_SETTINGS = {
     'dice_win_chance': 5.0,
     'basketball_win_chance': 10.0,
     'slots_win_chance': 4.0,
-    'blackjack_win_chance': 3.0,
+    'lottery_win_chance': 15.0,   # Шанс выигрыша в лотерее
+    'wheel_win_chance': 25.0,     # Шанс выигрыша в колесе фортуны
 
     # Множители выигрыша
     'duel_multiplier': 1.8,
     'dice_multiplier': 3.0,
     'basketball_multiplier': 1.5,
     'slots_multiplier': 8.0,
-    'blackjack_multiplier': 2.0,
+    'lottery_multiplier': 10.0,   # x10 для лотереи
+    'wheel_multiplier': 5.0,      # x5 для колеса фортуны
 }
 
 # Экспорт новых констант
@@ -84,7 +86,8 @@ __all__ = [
     "DEFAULT_ASSET", "DEFAULT_CURRENCY_TYPE", "DEFAULT_FIAT",
     "INVOICE_EXPIRES_IN", "MIN_DEPOSIT", "MAX_DEPOSIT", "MIN_WITHDRAWAL",
     "DUEL_FAQ_URL", "DICE_FAQ_URL", "BASKETBALL_FAQ_URL",
-    "SLOTS_FAQ_URL", "BLACKJACK_FAQ_URL", "DARTS_FAQ_URL",
+    "SLOTS_FAQ_URL",
+    "LOTTERY_FAQ_URL", "WHEEL_FAQ_URL",
     "GROUPS", "BACKGROUND_IMAGE_URL", "ADMIN_IDS",
     "REFERRAL_BONUS", "REFERRAL_MIN_DEPOSIT", "DAILY_TASKS",
     "DEFAULT_GAME_SETTINGS"
