@@ -5596,14 +5596,14 @@ async def lottery_scheduler():
                     current_datetime = datetime.now(draw_datetime.tzinfo)
 
                     if current_datetime >= draw_datetime and status == 'active':
-                        print(f"⏰ Время розыгрыша лотереи #{draw_number} наступило!")
+                        print(f"[TIME] Время розыгрыша лотереи #{draw_number} наступило!")
 
                         # Проверяем, есть ли минимум 5 участников
                         tickets = await async_db.get_all_tickets_for_draw(draw_number)
                         unique_participants = len(set(ticket[2] for ticket in tickets))  # telegram_id уникальных участников
 
                         if unique_participants >= 5:
-                            print(f"✅ В лотерее #{draw_number} участвует {unique_participants} человек - проводим розыгрыш!")
+                            print(f"[OK] В лотерее #{draw_number} участвует {unique_participants} человек - проводим розыгрыш!")
                             await conduct_lottery_draw()
 
                             # Создаем следующий розыгрыш
@@ -5611,7 +5611,7 @@ async def lottery_scheduler():
                             await async_db.create_lottery_draw(next_draw_number)
                             print(f"🎫 Создан следующий розыгрыш лотереи #{next_draw_number}")
                         else:
-                            print(f"⏳ В лотерее #{draw_number} только {unique_participants} участников. Ждем еще людей (нужно минимум 5)")
+                            print(f"[WAIT] В лотерее #{draw_number} только {unique_participants} участников. Ждем еще людей (нужно минимум 5)")
                             # Продлеваем розыгрыш на 1 час
                             new_draw_time = current_datetime + timedelta(hours=1)
                             await asyncio.to_thread(async_db._execute_query,

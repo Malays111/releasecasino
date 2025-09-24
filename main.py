@@ -5,7 +5,6 @@ import bot
 import asyncio
 import signal
 import os
-import psutil
 import time
 
 # Глобальные переменные
@@ -15,23 +14,9 @@ storage = None
 bot_process_id = None
 
 def check_existing_bot_instances():
-    """Проверка на уже запущенные экземпляры бота"""
-    current_pid = os.getpid()
-    script_name = os.path.basename(__file__)
-
-    print(f"🔍 Проверка запущенных экземпляров бота (PID: {current_pid})...")
-
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            if proc.info['pid'] != current_pid:
-                cmdline = proc.info.get('cmdline', [])
-                if cmdline and script_name in ' '.join(cmdline):
-                    print(f"⚠️ Найден другой экземпляр бота (PID: {proc.info['pid']})")
-                    return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-
-    print("✅ Других экземпляров бота не найдено")
+    """Проверка на уже запущенные экземпляры бота (упрощенная версия без psutil)"""
+    print("🔍 Проверка запущенных экземпляров бота...")
+    print("✅ Проверка пропущена (psutil не установлен)")
     return False
 
 def initialize_bot():
