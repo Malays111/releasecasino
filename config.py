@@ -24,12 +24,12 @@ MAX_DEPOSIT = 10000.0
 MIN_WITHDRAWAL = 1.0  # Минимальная сумма вывода (ограничение CryptoBot API)
 
 # Ссылки на FAQ для игр
-DUEL_FAQ_URL = "https://t.me/VanishCasino/10"  # Замените на ссылку для дуэли (кости)
-DICE_FAQ_URL = "https://t.me/VanishCasino/11"  # Замените на ссылку для кубиков
-BASKETBALL_FAQ_URL = "https://t.me/VanishCasino/12"  # Замените на ссылку для баскетбола
-SLOTS_FAQ_URL = "https://t.me/VanishCasino/13"  # Замените на ссылку для слотов
-LOTTERY_FAQ_URL = "https://t.me/VanishCasino/15"  # FAQ для лотереи
-WHEEL_FAQ_URL = "https://t.me/VanishCasino/16"  # FAQ для колеса фортуны
+DUEL_FAQ_URL = "https://t.me/VanishCasino/52"  # Замените на ссылку для дуэли (кости)
+DICE_FAQ_URL = "https://t.me/VanishCasino/53"  # Замените на ссылку для кубиков
+BASKETBALL_FAQ_URL = "https://t.me/VanishCasino/54"  # Замените на ссылку для баскетбола
+SLOTS_FAQ_URL = "https://t.me/VanishCasino/55"  # Замените на ссылку для слотов
+LOTTERY_FAQ_URL = "https://t.me/VanishCasino/57"  # FAQ для лотереи
+WHEEL_FAQ_URL = "https://t.me/VanishCasino/56"  # FAQ для колеса фортуны
 
 # Ссылки на группы
 GROUPS = [
@@ -91,4 +91,5 @@ __all__ = [
     "GROUPS", "BACKGROUND_IMAGE_URL", "ADMIN_IDS",
     "REFERRAL_BONUS", "REFERRAL_MIN_DEPOSIT", "DAILY_TASKS",
     "DEFAULT_GAME_SETTINGS"
+
 ]
