@@ -21,7 +21,7 @@ INVOICE_EXPIRES_IN = 180  # 3 минуты в секундах
 # Минимальные и максимальные суммы
 MIN_DEPOSIT = 1.0
 MAX_DEPOSIT = 10000.0
-MIN_WITHDRAWAL = 1.0  # Минимальная сумма вывода (ограничение CryptoBot API)
+MIN_WITHDRAWAL = 5.0  # Минимальная сумма вывода (ограничение CryptoBot API)
 
 # Ссылки на FAQ для игр
 DUEL_FAQ_URL = "https://t.me/VanishCasino/52"  # Замените на ссылку для дуэли (кости)
@@ -93,4 +93,5 @@ __all__ = [
     "DEFAULT_GAME_SETTINGS"
 
 ]
+
 
