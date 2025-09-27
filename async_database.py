@@ -80,6 +80,11 @@ class AsyncDatabase:
         except sqlite3.OperationalError:
             pass
 
+        try:
+            await asyncio.to_thread(self._execute_query, "ALTER TABLE users ADD COLUMN referral_notification_sent INTEGER DEFAULT 0", commit=True)
+        except sqlite3.OperationalError:
+            pass
+
         # Таблица платежей
         await asyncio.to_thread(self._execute_query, '''
             CREATE TABLE IF NOT EXISTS payments (
@@ -181,6 +186,17 @@ class AsyncDatabase:
             )
         ''', commit=True)
 
+        # Таблица коротких реферальных кодов
+        await asyncio.to_thread(self._execute_query, '''
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                id INTEGER PRIMARY KEY,
+                telegram_id INTEGER UNIQUE,
+                short_code TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+            )
+        ''', commit=True)
+
         # Таблица тикетов поддержки
         await asyncio.to_thread(self._execute_query, '''
             CREATE TABLE IF NOT EXISTS support_tickets (
@@ -271,6 +287,8 @@ class AsyncDatabase:
             cursor.execute(query, params)
             if commit:
                 conn.commit()
+                # Принудительное сохранение на диск после каждого коммита
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
             if fetchone:
                 return cursor.fetchone()
             if fetchall:
@@ -301,7 +319,7 @@ class AsyncDatabase:
 
     async def get_user(self, telegram_id: int) -> Optional[Tuple]:
         user = await asyncio.to_thread(self._execute_query,
-            "SELECT id, telegram_id, username, balance, referral_count, COALESCE(referral_balance, 0) as referral_balance, COALESCE(total_deposited, 0) as total_deposited, COALESCE(total_spent, 0) as total_spent, COALESCE(games_played, 0) as games_played, referrer_id, referral_bonus_given, last_daily_task_completed, COALESCE(active_referrals_count, 0) as active_referrals_count, created_at FROM users WHERE telegram_id = ?",
+            "SELECT id, telegram_id, username, balance, referral_count, COALESCE(referral_balance, 0) as referral_balance, COALESCE(total_deposited, 0) as total_deposited, COALESCE(total_spent, 0) as total_spent, COALESCE(games_played, 0) as games_played, referrer_id, referral_bonus_given, last_daily_task_completed, COALESCE(active_referrals_count, 0) as active_referrals_count, COALESCE(referral_notification_sent, 0) as referral_notification_sent, created_at FROM users WHERE telegram_id = ?",
             (telegram_id,), fetchone=True)
 
         if user:
@@ -320,7 +338,7 @@ class AsyncDatabase:
 
     async def get_user_by_username(self, username: str) -> Optional[Tuple]:
         user = await asyncio.to_thread(self._execute_query,
-            "SELECT id, telegram_id, username, balance, referral_count, COALESCE(referral_balance, 0) as referral_balance, COALESCE(total_deposited, 0) as total_deposited, COALESCE(total_spent, 0) as total_spent, COALESCE(games_played, 0) as games_played, referrer_id, referral_bonus_given, last_daily_task_completed, COALESCE(active_referrals_count, 0) as active_referrals_count, created_at FROM users WHERE username = ?",
+            "SELECT id, telegram_id, username, balance, referral_count, COALESCE(referral_balance, 0) as referral_balance, COALESCE(total_deposited, 0) as total_deposited, COALESCE(total_spent, 0) as total_spent, COALESCE(games_played, 0) as games_played, referrer_id, referral_bonus_given, last_daily_task_completed, COALESCE(active_referrals_count, 0) as active_referrals_count, COALESCE(referral_notification_sent, 0) as referral_notification_sent, created_at FROM users WHERE username = ?",
             (username,), fetchone=True)
 
         if user:
@@ -344,7 +362,7 @@ class AsyncDatabase:
 
         if existing_user:
             # Пользователь уже существует
-            current_referrer_id = existing_user[0]
+            current_referrer_id = existing_user[0] if existing_user[0] is not None else None
             if current_referrer_id is None and referrer_id is not None:
                 # Устанавливаем referrer_id, если его нет
                 await asyncio.to_thread(self._execute_query,
@@ -354,6 +372,10 @@ class AsyncDatabase:
                 await asyncio.to_thread(self._execute_query,
                     "UPDATE users SET referral_count = COALESCE(referral_count, 0) + 1 WHERE telegram_id = ?",
                     (referrer_id,), commit=True)
+                # Принудительное сохранение
+                await self._force_save()
+                await self._force_checkpoint()
+                print(f"✅ Реферер установлен для пользователя {telegram_id}, данные сохранены")
         else:
             # Создаем нового пользователя
             try:
@@ -367,11 +389,20 @@ class AsyncDatabase:
                         "UPDATE users SET referral_count = COALESCE(referral_count, 0) + 1 WHERE telegram_id = ?",
                         (referrer_id,), commit=True)
 
+                # Принудительное сохранение для новых пользователей и рефералов
+                await self._force_save()
+                await self._force_checkpoint()
+                print(f"✅ Новый пользователь {telegram_id} создан, данные сохранены")
+
             except sqlite3.OperationalError:
                 # Если колонки нет, вставляем без них
                 await asyncio.to_thread(self._execute_query,
                     "INSERT INTO users (telegram_id, username) VALUES (?, ?)",
                     (telegram_id, username), commit=True)
+                # Принудительное сохранение
+                await self._force_save()
+                await self._force_checkpoint()
+                print(f"✅ Новый пользователь {telegram_id} создан (без реферала), данные сохранены")
 
     async def update_balance(self, telegram_id: int, amount: float):
         try:
@@ -391,6 +422,11 @@ class AsyncDatabase:
                 "UPDATE users SET total_spent = COALESCE(total_spent, 0) + ? WHERE telegram_id = ?",
                 (-amount, telegram_id), commit=True)
 
+        # Принудительное сохранение после каждого изменения баланса
+        await self._force_save()
+        await self._force_checkpoint()
+        print(f"✅ Баланс пользователя {telegram_id} обновлен на {amount}, данные сохранены")
+
     async def update_referral_balance(self, telegram_id: int, amount: float):
         try:
             amount = float(amount)
@@ -400,6 +436,17 @@ class AsyncDatabase:
         await asyncio.to_thread(self._execute_query,
             "UPDATE users SET referral_balance = COALESCE(referral_balance, 0) + ? WHERE telegram_id = ?",
             (amount, telegram_id), commit=True)
+
+        # Обновляем active_referrals_count если это пополнение от реферала
+        if amount > 0:
+            await asyncio.to_thread(self._execute_query,
+                "UPDATE users SET active_referrals_count = COALESCE(active_referrals_count, 0) + 1 WHERE telegram_id = ?",
+                (telegram_id,), commit=True)
+
+        # Принудительное сохранение для реферальных бонусов
+        await self._force_save()
+        await self._force_checkpoint()
+        print(f"✅ Реферальный баланс пользователя {telegram_id} обновлен на {amount}, данные сохранены")
 
     async def update_active_referrals_count(self, telegram_id: int, amount: float):
         """Обновление счетчика активных рефералов (тех, кто пополнил баланс на 2$+)"""
@@ -421,14 +468,19 @@ class AsyncDatabase:
         return 0.0
 
     async def create_payment(self, user_id: int, amount: float, invoice_id: str, message_id: int = None, chat_id: int = None) -> int:
-        return await asyncio.to_thread(self._execute_query,
+        result = await asyncio.to_thread(self._execute_query,
             "INSERT INTO payments (user_id, amount, crypto_bot_invoice_id, status, message_id, chat_id) VALUES (?, ?, ?, 'pending', ?, ?)",
             (user_id, amount, invoice_id, message_id, chat_id), commit=True)
+        # Принудительное сохранение для платежей
+        await self._force_save()
+        return result
 
     async def update_payment_status(self, invoice_id: str, status: str):
         await asyncio.to_thread(self._execute_query,
             "UPDATE payments SET status = ? WHERE crypto_bot_invoice_id = ?",
             (status, invoice_id), commit=True)
+        # Принудительное сохранение для обновления статуса платежа
+        await self._force_save()
 
     async def get_top_deposited(self, limit: int = 5) -> List[Tuple[str, float]]:
         return await asyncio.to_thread(self._execute_query,
@@ -443,6 +495,11 @@ class AsyncDatabase:
     async def get_top_referrals(self, limit: int = 5) -> List[Tuple[str, int]]:
         return await asyncio.to_thread(self._execute_query,
             "SELECT username, active_referrals_count FROM users ORDER BY active_referrals_count DESC LIMIT ?",
+            (limit,), fetchall=True)
+
+    async def get_top_wins(self, limit: int = 5) -> List[Tuple[str, float]]:
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT username, (COALESCE(total_deposited, 0) - COALESCE(total_spent, 0)) as net_profit FROM users ORDER BY net_profit DESC LIMIT ?",
             (limit,), fetchall=True)
 
     async def update_games_played(self, telegram_id: int):
@@ -470,6 +527,8 @@ class AsyncDatabase:
         await asyncio.to_thread(self._execute_query,
             "INSERT OR REPLACE INTO text_settings (setting_key, setting_value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
             (key, str(value)), commit=True)
+        # Принудительное сохранение для настроек
+        await self._force_save()
 
     async def get_setting(self, key: str, default_value: Optional[str] = None) -> Optional[str]:
         result = await asyncio.to_thread(self._execute_query,
@@ -478,9 +537,12 @@ class AsyncDatabase:
         return result[0] if result else default_value
 
     async def create_withdrawal(self, user_id: int, amount: float, wallet_address: str) -> int:
-        return await asyncio.to_thread(self._execute_query,
+        result = await asyncio.to_thread(self._execute_query,
             "INSERT INTO withdrawals (user_id, amount, wallet_address) VALUES (?, ?, ?)",
             (user_id, amount, wallet_address), commit=True)
+        # Принудительное сохранение для выводов
+        await self._force_save()
+        return result
 
     async def update_withdrawal_status(self, withdrawal_id: int, status: str, transfer_id: Optional[str] = None):
         if transfer_id:
@@ -491,6 +553,8 @@ class AsyncDatabase:
             await asyncio.to_thread(self._execute_query,
                 "UPDATE withdrawals SET status = ? WHERE id = ?",
                 (status, withdrawal_id), commit=True)
+        # Принудительное сохранение для обновления статуса вывода
+        await self._force_save()
 
     async def create_promo_code(self, code: str, reward_amount: float, max_activations: int, expires_at: Optional[str], created_by: int) -> int:
         return await asyncio.to_thread(self._execute_query,
@@ -554,6 +618,8 @@ class AsyncDatabase:
             await asyncio.to_thread(self._execute_query,
                 "INSERT INTO user_logs (telegram_id, action, amount, reason) VALUES (?, ?, ?, ?)",
                 (telegram_id, action, amount, reason), commit=True)
+            # Принудительное сохранение для логов
+            await self._force_save()
         except Exception:
             pass  # Игнорируем ошибки логирования
 
@@ -571,6 +637,12 @@ class AsyncDatabase:
         """Отметка реферального бонуса как начисленного"""
         await asyncio.to_thread(self._execute_query,
             "UPDATE users SET referral_bonus_given = 1 WHERE telegram_id = ?",
+            (telegram_id,), commit=True)
+
+    async def mark_referral_notification_sent(self, telegram_id: int):
+        """Отметка реферального уведомления как отправленного"""
+        await asyncio.to_thread(self._execute_query,
+            "UPDATE users SET referral_notification_sent = 1 WHERE telegram_id = ?",
             (telegram_id,), commit=True)
 
     async def get_payment_by_invoice(self, invoice_id: str) -> Optional[Tuple]:
@@ -702,6 +774,22 @@ class AsyncDatabase:
         except Exception as e:
             print(f"⚠️ Ошибка принудительного сохранения: {e}")
 
+            # Альтернативный метод сохранения при ошибке
+            try:
+                await asyncio.to_thread(self._execute_query, "COMMIT;", commit=True)
+                print("💾 Альтернативное сохранение выполнено")
+            except Exception as e2:
+                print(f"⚠️ Ошибка альтернативного сохранения: {e2}")
+
+    async def _force_save(self):
+        """Принудительное сохранение данных после важных изменений"""
+        try:
+            # Принудительно сохраняем изменения на диск
+            await asyncio.to_thread(self._execute_query, "PRAGMA wal_checkpoint(PASSIVE);", commit=True)
+        except Exception as e:
+            # Игнорируем ошибки принудительного сохранения в обычных операциях
+            pass
+
     # Функции для работы с тикетами поддержки
     async def create_support_ticket(self, telegram_id: int, username: str, issue: str) -> int:
         """Создание нового тикета поддержки"""
@@ -781,3 +869,58 @@ class AsyncDatabase:
             "SELECT COUNT(*) FROM support_tickets WHERE status = 'open'",
             fetchone=True)
         return result[0] if result else 0
+
+    # Функции для работы с короткими реферальными кодами
+    async def create_referral_code(self, telegram_id: int) -> str:
+        """Создание короткого реферального кода для пользователя"""
+        import random
+        import string
+
+        # Проверяем, есть ли уже код для этого пользователя
+        existing_code = await asyncio.to_thread(self._execute_query,
+            "SELECT short_code FROM referral_codes WHERE telegram_id = ?",
+            (telegram_id,), fetchone=True)
+
+        if existing_code:
+            return existing_code[0]
+
+        # Генерируем короткий код (6 символов)
+        while True:
+            short_code = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+
+            # Проверяем, что код уникальный
+            existing = await asyncio.to_thread(self._execute_query,
+                "SELECT id FROM referral_codes WHERE short_code = ?",
+                (short_code,), fetchone=True)
+
+            if not existing:
+                break
+
+        # Сохраняем код в базу данных
+        await asyncio.to_thread(self._execute_query,
+            "INSERT INTO referral_codes (telegram_id, short_code) VALUES (?, ?)",
+            (telegram_id, short_code), commit=True)
+
+        # Проверяем, что код действительно сохранился
+        check_result = await asyncio.to_thread(self._execute_query,
+            "SELECT short_code FROM referral_codes WHERE telegram_id = ? AND short_code = ?",
+            (telegram_id, short_code), fetchone=True)
+
+        if check_result:
+            print(f"✅ Короткий код {short_code} успешно сохранен для пользователя {telegram_id}")
+        else:
+            print(f"❌ Ошибка сохранения кода {short_code} для пользователя {telegram_id}")
+
+        return short_code
+
+    async def get_telegram_id_by_referral_code(self, short_code: str) -> Optional[int]:
+        """Получение telegram_id по короткому реферальному коду"""
+        try:
+            result = await asyncio.to_thread(self._execute_query,
+                "SELECT telegram_id FROM referral_codes WHERE short_code = ?",
+                (short_code,), fetchone=True)
+            print(f"🔍 Поиск кода {short_code} в БД, результат: {result}")
+            return result[0] if result else None
+        except Exception as e:
+            print(f"❌ Ошибка поиска кода {short_code}: {e}")
+            return None

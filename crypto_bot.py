@@ -30,7 +30,7 @@ class CryptoBotAPI:
             "currency_type": currency_type,
             "fiat": fiat,
             "paid_btn_name": "viewItem",
-            "paid_btn_url": "https://t.me/VanishCasinoBot"
+            "paid_btn_url": "https://t.me/Testbotcazikbot"
         }
 
         # Добавляем поддерживаемые криптовалюты

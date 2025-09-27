@@ -2,6 +2,7 @@ from aiogram import types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import Command
 from config import (
     TELEGRAM_TOKEN, DEPOSIT_AMOUNTS, CASINO_NAME,
     SUPPORTED_ASSETS, DEFAULT_ASSET, DEFAULT_CURRENCY_TYPE, DEFAULT_FIAT,
@@ -36,6 +37,7 @@ vip_group_id = None  # ID VIP группы для отправки выплат
 top_deposited_cache = []
 top_spent_cache = []
 top_referrals_cache = []
+top_wins_cache = []
 last_cache_update = 0
 CACHE_UPDATE_INTERVAL = 120  # 2 минуты в секундах
 top_cache_lock = asyncio.Lock()  # Защита от race conditions
@@ -103,6 +105,16 @@ async def delete_notification_after_delay(chat_id, message_id, delay_seconds):
     except Exception as e:
         print(f"Ошибка удаления уведомления: {e}")
 
+# Функция для отправки отложенного реферального уведомления
+async def send_delayed_referral_notification(chat_id, notification_text):
+    """Отправляет реферального уведомления через 2 секунды"""
+    try:
+        await asyncio.sleep(2)
+        await bot.send_message(chat_id=chat_id, text=notification_text, parse_mode="HTML")
+        print(f"Реферальное уведомление отправлено в чат {chat_id}")
+    except Exception as e:
+        print(f"Ошибка отправки реферального уведомления: {e}")
+
 # Асинхронная отправка результатов игры в группу (без блокировки)
 async def send_game_result_to_group(game_name, username, bet, result_text, winnings_label, winnings):
     """Асинхронная отправка результата игры в группу"""
@@ -146,17 +158,21 @@ async def async_update_referral_balance(telegram_id, amount):
     """Обновление реферального баланса"""
     await async_db.update_referral_balance(telegram_id, amount)
 
-async def async_get_top_deposited(limit=5):
+async def async_get_top_deposited(limit=10):
     """Получение топа по пополнениям"""
     return await async_db.get_top_deposited(limit)
 
-async def async_get_top_spent(limit=5):
+async def async_get_top_spent(limit=10):
     """Получение топа по тратам"""
     return await async_db.get_top_spent(limit)
 
-async def async_get_top_referrals(limit=5):
+async def async_get_top_referrals(limit=10):
     """Получение топа по рефералам"""
     return await async_db.get_top_referrals(limit)
+
+async def async_get_top_wins(limit=15):
+    """Получение топа по выигрышам"""
+    return await async_db.get_top_wins(limit)
 
 async def async_load_all_game_settings():
     """Загрузка всех настроек игр"""
@@ -224,6 +240,14 @@ async def async_get_user_logs_by_username(username=None, limit=50):
     else:
         return []
 
+async def async_create_referral_code(telegram_id):
+    """Создание короткого реферального кода"""
+    return await async_db.create_referral_code(telegram_id)
+
+async def async_get_telegram_id_by_referral_code(short_code):
+    """Получение telegram_id по короткому коду"""
+    return await async_db.get_telegram_id_by_referral_code(short_code)
+
 async def async_get_payment_by_invoice(invoice_id):
     """Получение платежа по invoice_id"""
     return await async_db.get_payment_by_invoice(invoice_id)
@@ -261,14 +285,19 @@ async def preload_data():
     try:
         # Загружаем топы сразу
         async with top_cache_lock:
-            top_deposited_cache = await async_get_top_deposited(5)
-            top_spent_cache = await async_get_top_spent(5)
-            top_referrals_cache = await async_get_top_referrals(5)
+            top_deposited_cache = await async_get_top_deposited(10)
+            top_spent_cache = await async_get_top_spent(10)
+            top_referrals_cache = await async_get_top_referrals(10)
+            top_wins_cache = await async_get_top_wins(15)
             last_cache_update = time.time()
 
         # Загружаем настройки игр
         global settings
         settings = await async_load_all_game_settings()
+
+        # Принудительное сохранение базы данных после загрузки
+        await async_db._force_checkpoint()
+        print("💾 База данных сохранена после предзагрузки")
 
         # Запускаем очистку rate limiting кэша
         asyncio.create_task(cleanup_rate_limit_cache())
@@ -293,25 +322,27 @@ async def update_top_cache():
         current_time = time.time()
         if current_time - last_cache_update >= CACHE_UPDATE_INTERVAL:
             async with top_cache_lock:
-                top_deposited_cache = await async_get_top_deposited(5)
-                top_spent_cache = await async_get_top_spent(5)
-                top_referrals_cache = await async_get_top_referrals(5)
+                top_deposited_cache = await async_get_top_deposited(10)
+                top_spent_cache = await async_get_top_spent(10)
+                top_referrals_cache = await async_get_top_referrals(10)
+                top_wins_cache = await async_get_top_wins(15)
                 last_cache_update = current_time
                 print("Кэш топов обновлен")
         await asyncio.sleep(30)  # Проверяем каждые 30 секунд
 
 # Функция получения топов из кэша
 async def get_cached_tops():
-    global top_deposited_cache, top_spent_cache, top_referrals_cache, last_cache_update
+    global top_deposited_cache, top_spent_cache, top_referrals_cache, top_wins_cache, last_cache_update
     current_time = time.time()
     if current_time - last_cache_update >= CACHE_UPDATE_INTERVAL:
         # Если кэш устарел, обновляем асинхронно
         async with top_cache_lock:
-            top_deposited_cache = await async_get_top_deposited(5)
-            top_spent_cache = await async_get_top_spent(5)
-            top_referrals_cache = await async_get_top_referrals(5)
+            top_deposited_cache = await async_get_top_deposited(10)
+            top_spent_cache = await async_get_top_spent(10)
+            top_referrals_cache = await async_get_top_referrals(10)
+            top_wins_cache = await async_get_top_wins(15)
             last_cache_update = current_time
-    return top_deposited_cache, top_spent_cache, top_referrals_cache
+    return top_deposited_cache, top_spent_cache, top_referrals_cache, top_wins_cache
 
 # Функция получения баланса из кэша (асинхронная)
 async def get_cached_balance(user_id):
@@ -428,11 +459,80 @@ async def safe_callback_answer(callback_query, text=None, show_alert=False):
         else:
             print(f"Ошибка callback answer: {e}")
 
+# Безопасный ответ на сообщение
+async def safe_message_reply(message, text, **kwargs):
+    """Безопасный ответ на сообщение с обработкой ошибок"""
+    try:
+        return await message.reply(text, **kwargs)
+    except Exception as e:
+        # Если сообщение недоступно для reply, используем answer
+        if "message to be replied not found" in str(e) or "Bad Request" in str(e):
+            return await message.answer(text, **kwargs)
+        else:
+            print(f"Ошибка reply: {e}")
+            return await message.answer(text, **kwargs)
+
 # Функция получения задания дня
 def get_daily_task():
     today = date.today()
     day_index = (today.toordinal() - date(2025, 9, 19).toordinal()) % len(DAILY_TASKS)
     return DAILY_TASKS[day_index]
+
+# Функция получения эмодзи медали для позиций в рейтинге
+def get_medal_emoji(position):
+    """Возвращает эмодзи медали для позиции в рейтинге"""
+    if position == 1:
+        return "🥇"
+    elif position == 2:
+        return "🥈"
+    elif position == 3:
+        return "🥉"
+    elif position <= 10:
+        return "🏅"
+    else:
+        return "🎖️"
+
+# Функция получения ранга игрока
+async def get_player_rank(user_id):
+    """Получает ранг игрока в топе по балансу"""
+    try:
+        # Получаем топ пользователей по балансу
+        result = await asyncio.to_thread(async_db._execute_query,
+            "SELECT telegram_id FROM users ORDER BY balance DESC LIMIT 50", fetchall=True)
+
+        for i, (telegram_id,) in enumerate(result, 1):
+            if telegram_id == user_id:
+                return f"{i}/50"
+        return "50+"
+    except:
+        return "Неизвестен"
+
+# Функция получения советов по улучшению
+def get_improvement_tips(roi, games_played, avg_bet):
+    """Возвращает советы по улучшению игры"""
+    tips = []
+
+    if roi < 0:
+        tips.append("💡 <i>Сосредоточьтесь на играх с лучшими шансами</i>")
+        tips.append("🎯 <i>Используйте меньшие ставки для практики</i>")
+    elif roi < 20:
+        tips.append("📈 <i>Изучайте стратегии игр для повышения винрейта</i>")
+        tips.append("🎲 <i>Пробуйте разные игры для поиска profitable</i>")
+
+    if games_played < 10:
+        tips.append("🎮 <i>Сыграйте больше игр для получения опыта</i>")
+    elif games_played > 100 and roi > 30:
+        tips.append("🏆 <i>Отличная игра! Продолжайте в том же духе</i>")
+
+    if avg_bet > 50:
+        tips.append("⚠️ <i>Рассмотрите снижение размера ставок</i>")
+    elif avg_bet < 1:
+        tips.append("💰 <i>Можете попробовать немного увеличить ставки</i>")
+
+    if not tips:
+        tips.append("🎉 <i>У вас отличная статистика! Продолжайте играть</i>")
+
+    return "\n".join(tips)
 
 # Функция очистки rate limiting кэша
 async def cleanup_rate_limit_cache():
@@ -754,7 +854,7 @@ async def get_welcome_text(user):
     # Получаем задание дня
     task = get_daily_task()
 
-    welcome_text = f"""🎰 <b>{CASINO_NAME}</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
+    welcome_text = f"""🎰 <b>Test Casino</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
 
  {greeting}!
 
@@ -776,21 +876,167 @@ async def get_welcome_text(user):
 # Обработчик /start и /restart
 async def start_command(message: types.Message):
     user = message.from_user
+    print(f"🚀 Обработка /start для пользователя {user.id} (@{user.username})")
+    print(f"📝 Полное сообщение: '{message.text}'")
 
     # Проверяем реферальную ссылку
-    args = message.text.split()
     referrer_id = None
-    if len(args) > 1 and args[1].isdigit():
-        potential_referrer_id = int(args[1])
-        # Проверяем, что пользователь не приглашает сам себя
-        if potential_referrer_id != user.id:
-            referrer_id = potential_referrer_id
 
-    await async_create_user(user.id, user.username, referrer_id)
+    # Сначала проверяем deep link параметры через start_parameter (aiogram 3.x)
+    if hasattr(message, 'start_parameter') and message.start_parameter:
+        referral_param = message.start_parameter
+        print(f"🔗 Deep link параметр найден: '{referral_param}'")
 
-    welcome_text, parse_mode = await get_welcome_text(user)
-    main_menu = await get_main_menu(user.id)
-    await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+        if referral_param.isdigit():
+            # Старый формат: ID пользователя
+            potential_referrer_id = int(referral_param)
+            # Проверяем, что пользователь не приглашает сам себя
+            if potential_referrer_id != user.id:
+                referrer_id = potential_referrer_id
+                print(f"👥 Реферальный параметр найден (старый формат через start_parameter): {referrer_id}")
+            else:
+                print(f"⚠️ Пользователь {user.id} пытался пригласить сам себя через start_parameter")
+        else:
+            # Новый формат: короткий код
+            try:
+                print(f"🔍 Поиск пользователя по короткому коду: '{referral_param}'")
+                potential_referrer_id = await async_get_telegram_id_by_referral_code(referral_param)
+                print(f"🔍 Результат поиска: {potential_referrer_id}")
+
+                if potential_referrer_id and potential_referrer_id != user.id:
+                    referrer_id = potential_referrer_id
+                    print(f"👥 Реферальный параметр найден (короткий код через start_parameter): {referral_param} -> {referrer_id}")
+                elif potential_referrer_id == user.id:
+                    print(f"⚠️ Пользователь {user.id} пытался пригласить сам себя через короткий код в start_parameter")
+                else:
+                    print(f"⚠️ Короткий код не найден или некорректный: '{referral_param}'")
+                    print(f"🔍 Проверяем, существует ли код в базе данных...")
+                    # Попробуем найти все коды для отладки
+                    try:
+                        all_codes = await asyncio.to_thread(async_db._execute_query,
+                            "SELECT short_code, telegram_id FROM referral_codes LIMIT 5", fetchall=True)
+                        print(f"🔍 Первые 5 кодов в БД: {all_codes}")
+                    except Exception as debug_e:
+                        print(f"🔍 Ошибка отладочного запроса: {debug_e}")
+            except Exception as e:
+                print(f"❌ Ошибка обработки короткого кода '{referral_param}': {e}")
+
+    # Если не нашли через start_parameter, проверяем аргументы команды (fallback)
+    if not referrer_id:
+        args = message.text.split()
+        if len(args) > 1:
+            print(f"📋 Аргументы команды: {args}")
+            referral_param = args[1]
+
+            if referral_param.isdigit():
+                # Старый формат: ID пользователя
+                potential_referrer_id = int(referral_param)
+                # Проверяем, что пользователь не приглашает сам себя
+                if potential_referrer_id != user.id:
+                    referrer_id = potential_referrer_id
+                    print(f"👥 Реферальный параметр найден (старый формат через args): {referrer_id}")
+                else:
+                    print(f"⚠️ Пользователь {user.id} пытался пригласить сам себя через args")
+            else:
+                # Новый формат: короткий код
+                try:
+                    print(f"🔍 Поиск пользователя по короткому коду (fallback): '{referral_param}'")
+                    potential_referrer_id = await async_get_telegram_id_by_referral_code(referral_param)
+                    print(f"🔍 Результат поиска (fallback): {potential_referrer_id}")
+
+                    if potential_referrer_id and potential_referrer_id != user.id:
+                        referrer_id = potential_referrer_id
+                        print(f"👥 Реферальный параметр найден (короткий код через args): {referral_param} -> {referrer_id}")
+                    elif potential_referrer_id == user.id:
+                        print(f"⚠️ Пользователь {user.id} пытался пригласить сам себя через короткий код в args")
+                    else:
+                        print(f"⚠️ Короткий код не найден или некорректный (fallback): '{referral_param}'")
+                except Exception as e:
+                    print(f"❌ Ошибка обработки короткого кода (fallback) '{referral_param}': {e}")
+        else:
+            print("📝 Нет дополнительных аргументов в команде /start")
+
+    try:
+        await async_create_user(user.id, user.username, referrer_id)
+        print(f"✅ Пользователь {user.id} создан/обновлен в БД")
+    except Exception as e:
+        print(f"❌ Ошибка создания пользователя: {e}")
+        # Продолжаем работу даже при ошибке создания пользователя
+
+    try:
+        welcome_text, parse_mode = await get_welcome_text(user)
+        main_menu = await get_main_menu(user.id)
+        print(f"📝 Приветственное сообщение сгенерировано для {user.id}")
+    except Exception as e:
+        print(f"❌ Ошибка генерации приветственного сообщения: {e}")
+        # Отправляем простое сообщение об ошибке
+        try:
+            await message.answer("❌ Произошла ошибка. Попробуйте еще раз через /start")
+            print(f"📤 Сообщение об ошибке отправлено пользователю {user.id}")
+        except Exception as e2:
+            print(f"❌ Не удалось отправить даже сообщение об ошибке: {e2}")
+        return
+
+    # Если пользователь пришел по реферальной ссылке, добавляем информацию в приветствие
+    if referrer_id:
+        try:
+            referrer_data = await async_get_user(referrer_id)
+            if referrer_data:
+                referrer_username = referrer_data[2] or f"ID:{referrer_id}"
+                referral_info = f"""
+
+👥 <b>Вы были приглашены пользователем @{referrer_username}!</b>
+💰 После пополнения баланса на 2$+ он получит реферальный бонус!"""
+                welcome_text += referral_info
+                print(f"✅ Информация о реферере добавлена для {user.id}")
+            else:
+                print(f"⚠️ Реферер {referrer_id} не найден в БД")
+        except Exception as e:
+            print(f"❌ Ошибка получения данных реферера: {e}")
+
+    print(f"📊 Завершена обработка /start для пользователя {user.id}")
+    print(f"📊 Реферальная информация: referrer_id={referrer_id}")
+
+    # Отправляем приветственное сообщение
+    try:
+        await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+        print(f"📤 Приветственное сообщение с фото отправлено пользователю {user.id}")
+    except Exception as e:
+        print(f"⚠️ Ошибка отправки приветственного сообщения с фото: {e}")
+        # Попробуем отправить без фото
+        try:
+            await message.answer(welcome_text, reply_markup=main_menu, parse_mode=parse_mode)
+            print(f"📤 Приветственное сообщение без фото отправлено пользователю {user.id}")
+        except Exception as e2:
+            print(f"❌ Ошибка отправки сообщения без фото: {e2}")
+            # Последняя попытка - отправить простое сообщение
+            try:
+                await message.answer("🎰 Добро пожаловать в Test Casino!\n\nИспользуйте кнопки ниже для навигации.", reply_markup=main_menu)
+                print(f"📤 Простое приветственное сообщение отправлено пользователю {user.id}")
+            except Exception as e3:
+                print(f"❌ Критическая ошибка: не удалось отправить ни одно сообщение пользователю {user.id}: {e3}")
+
+
+    # Если пользователь пришел по реферальной ссылке, отправляем дополнительное уведомление рефереру
+    if referrer_id:
+        try:
+            # Проверяем, было ли уже отправлено уведомление для этого реферала (проверяем у самого пользователя)
+            user_data = await async_get_user(user.id)
+            if user_data and len(user_data) > 13:
+                notification_sent = user_data[13]  # referral_notification_sent
+                if notification_sent:
+                    print(f"📨 Уведомление рефереру {referrer_id} уже было отправлено ранее для пользователя {user.id}")
+                else:
+                    print(f"📨 Отправляем уведомление рефереру {referrer_id} о новом реферале {user.id}")
+                    referrer_text = f"🎉 У вас новый реферал!\n👤 Пользователь: @{user.username or 'Неизвестен'}\n💰 После пополнения на 2$+ вы получите {REFERRAL_BONUS}$"
+                    await bot.send_message(chat_id=referrer_id, text=referrer_text)
+                    # Отмечаем, что уведомление отправлено
+                    await async_db.mark_referral_notification_sent(user.id)
+                    print(f"✅ Уведомление рефереру отправлено и отмечено в БД")
+            else:
+                print(f"⚠️ Не удалось получить данные пользователя {user.id}")
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить уведомление рефереру: {e}")
 
 # Обработчик /give для админов
 async def give_command(message: types.Message):
@@ -879,12 +1125,18 @@ async def stats_command(message: types.Message):
 # Обработчик /set для админов
 async def set_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.reply("❌ У вас нет прав администратора")
+        try:
+            await message.reply("❌ У вас нет прав администратора")
+        except:
+            await message.answer("❌ У вас нет прав администратора")
         return
 
     args = message.text.split()
     if len(args) != 3:
-        await message.reply("Использование: /set @username amount или /set telegram_id amount\nПример: /set @testuser 500 или /set 123456789 500")
+        try:
+            await message.reply("Использование: /set @username amount или /set telegram_id amount\nПример: /set @testuser 500 или /set 123456789 500")
+        except:
+            await message.answer("Использование: /set @username amount или /set telegram_id amount\nПример: /set @testuser 500 или /set 123456789 500")
         return
 
     identifier = args[1]
@@ -902,7 +1154,7 @@ async def set_command(message: types.Message):
     try:
         amount = float(args[2])
     except ValueError:
-        await message.reply("❌ Неверная сумма")
+        await safe_message_reply(message, "❌ Неверная сумма")
         return
 
     # Найти user
@@ -912,7 +1164,7 @@ async def set_command(message: types.Message):
         else:
             user_data = await async_get_user_by_username(username)
         if not user_data:
-            await message.reply("❌ Пользователь не найден")
+            await safe_message_reply(message, "❌ Пользователь не найден")
             return
 
         user_telegram_id = user_data[1]  # telegram_id
@@ -925,9 +1177,9 @@ async def set_command(message: types.Message):
         await invalidate_balance_cache(user_telegram_id)
         # Логируем установку баланса админом
         await async_log_action(user_telegram_id, "admin_set_balance", balance_diff, f"Баланс установлен админом {message.from_user.id} на {amount}$")
-        await message.reply(f"✅ Баланс пользователя @{user_username} установлен на {amount}$")
+        await safe_message_reply(message, f"✅ Баланс пользователя @{user_username} установлен на {amount}$")
     except Exception as e:
-        await message.reply(f"❌ Ошибка базы данных: {e}")
+        await safe_message_reply(message, f"❌ Ошибка базы данных: {e}")
 
 # Обработчик /chat для админов
 async def chat_command(message: types.Message):
@@ -1016,11 +1268,11 @@ async def fake_withdraw_command(message: types.Message):
     try:
         amount = float(args[2])
     except ValueError:
-        await message.reply("❌ Неверная сумма")
+        await safe_message_reply(message, "❌ Неверная сумма")
         return
 
     if amount <= 0:
-        await message.reply("❌ Сумма должна быть больше 0")
+        await safe_message_reply(message, "❌ Сумма должна быть больше 0")
         return
 
     # Убираем @ из username если есть
@@ -1032,7 +1284,7 @@ async def fake_withdraw_command(message: types.Message):
         user_data = await async_get_user_by_username(username)
 
         if not user_data:
-            await message.reply(f"❌ Пользователь @{username} не найден")
+            await safe_message_reply(message, f"❌ Пользователь @{username} не найден")
             return
 
         telegram_id = user_data[1]
@@ -1040,7 +1292,7 @@ async def fake_withdraw_command(message: types.Message):
 
         # Проверяем, установлена ли VIP группа
         if not vip_group_id:
-            await message.reply("❌ VIP группа не установлена. Используйте /setvip <ID_группы>")
+            await safe_message_reply(message, "❌ VIP группа не установлена. Используйте /setvip <ID_группы>")
             return
 
         # Формируем сообщение для VIP группы
@@ -1053,15 +1305,15 @@ async def fake_withdraw_command(message: types.Message):
         # Отправляем в VIP группу
         try:
             await bot.send_message(chat_id=vip_group_id, text=fake_message)
-            await message.reply(f"✅ Фейковый вывод отправлен в VIP группу!\n\n{fake_message}")
+            await safe_message_reply(message, f"✅ Фейковый вывод отправлен в VIP группу!\n\n{fake_message}")
         except Exception as e:
-            await message.reply(f"❌ Ошибка отправки в VIP группу: {e}")
+            await safe_message_reply(message, f"❌ Ошибка отправки в VIP группу: {e}")
 
         # Логируем действие
         await async_log_action(message.from_user.id, "admin_fake_withdraw", 0, f"Фейковый вывод для @{username}: {amount}$")
 
     except Exception as e:
-        await message.reply(f"❌ Ошибка: {e}")
+        await safe_message_reply(message, f"❌ Ошибка: {e}")
 
 
 
@@ -1251,58 +1503,25 @@ async def createpromo_command(message: types.Message):
     promo_id = await async_create_promo_code(code, reward_amount, max_activations, None, message.from_user.id)
 
     if promo_id:
-        # Отправляем сообщение в чат всем пользователям
-        try:
-            # Получаем всех пользователей из базы данных
-            result = await asyncio.to_thread(async_db._execute_query,
-                "SELECT telegram_id FROM users", (), fetchall=True)
-
-            if result:
-                # Счетчики для отчета
-                success_count = 0
-                error_count = 0
-
-                # Формируем сообщение для пользователей
-                promo_message = f"""🎉 <b>Новый промокод!</b>
-
-🎫 <b>Промокод:</b> <span class="tg-spoiler">{code}</span>
-💰 <b>Сумма:</b> {reward_amount}$
-🔢 <b>Активаций:</b> {max_activations}
-
-<i>Нажмите на промокод чтобы увидеть его!</i>"""
-
-                # Отправляем сообщение каждому пользователю
-                for (telegram_id,) in result:
-                    try:
-                        await bot.send_message(
-                            chat_id=telegram_id,
-                            text=promo_message,
-                            parse_mode="HTML"
-                        )
-                        success_count += 1
-                        # Небольшая пауза чтобы не превысить лимиты Telegram
-                        await asyncio.sleep(0.05)
-                    except Exception as e:
-                        print(f"Ошибка отправки промокода пользователю {telegram_id}: {e}")
-                        error_count += 1
-
-                # Отчет об отправке
-                report_text = f"""✅ <b>Промокод создан и разослан!</b>
-
-📊 <b>Статистика рассылки:</b>
-• ✅ Успешно отправлено: {success_count}
-• ❌ Ошибок: {error_count}
+        # Промокод создан успешно - убираем автоматическую рассылку
+        success_text = f"""✅ <b>Промокод успешно создан!</b>
 
 🎫 <b>Промокод:</b> <code>{code}</code>
-💰 <b>Сумма:</b> {reward_amount}$
-🔢 <b>Макс. активаций:</b> {max_activations}"""
+💰 <b>Сумма:</b> <code>{reward_amount}$</code>
+🔢 <b>Макс. активаций:</b> <code>{max_activations}</code>
 
-                await message.reply(report_text, parse_mode="HTML")
-            else:
-                await message.reply(f"✅ Промокод создан!\n\n🎫 Код: <code>{code}</code>\n💰 Сумма: {reward_amount}$\n🔢 Макс. активаций: {max_activations}", parse_mode="HTML")
-        except Exception as e:
-            print(f"Ошибка рассылки промокода: {e}")
-            await message.reply(f"✅ Промокод создан!\n\n🎫 Код: <code>{code}</code>\n💰 Сумма: {reward_amount}$\n🔢 Макс. активаций: {max_activations}", parse_mode="HTML")
+<i>Промокод создан и готов к использованию.
+Рассылка в чат пользователям отключена.</i>
+
+💡 <b>Для распространения:</b>
+• Отправьте промокод в группы вручную
+• Используйте команду /chat для анонса
+• Разместите в социальных сетях"""
+
+        await message.reply(success_text, parse_mode="HTML")
+
+        # Логируем создание промокода
+        await async_log_action(message.from_user.id, "promo_created", 0, f"Создан промокод {code} на {reward_amount}$ (макс. активаций: {max_activations})")
     else:
         await message.reply("❌ Ошибка создания промокода")
 
@@ -1847,7 +2066,7 @@ async def referral_handler(callback_query: types.CallbackQuery):
     💡 Приглашай друзей и зарабатывай! Получай 0.3$ за первое пополнение баланса каждым твоим рефералом на сумму от 2$!
 
     🔗 Ваша реферальная ссылка:
-    https://t.me/VanishCasinoBot?start={user.id}"""
+    https://t.me/Testbotcazikbot?start={user.id}"""
 
     referral_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Вывести реферальные", callback_data="withdraw_referral")],
@@ -1876,32 +2095,54 @@ async def profile_handler(callback_query: types.CallbackQuery):
     # Получаем задание дня
     task = get_daily_task()
 
-    profile_text = f"""👤 <b>ПРОФИЛЬ</b> 👤
+    # Вычисляем дополнительные метрики
+    net_profit = stats['total_deposited'] - stats['total_spent']
+    avg_bet = stats['total_spent'] / max(1, stats['games_played'])
+    profit_per_game = net_profit / max(1, stats['games_played'])
 
-    🎁 <b>Задание:</b><blockquote> {task['description']} 💰 Награда: {task['reward']}$ ✨ </blockquote>
+    profile_text = f"""👤 <b>ПРОФИЛЬ ИГРОКА</b> 👤
 
-    👤 <b>ИНФОРМАЦИЯ</b>
-    👨‍💻 <b>Имя пользователя:</b> @{stats['username']} ⭐
-    📅 Регистрация: {stats['created_at']}
+🎁 <b>ЕЖЕДНЕВНОЕ ЗАДАНИЕ</b>
+┌─────────────────────┐
+🏆 {task['description']}
+💰 Награда: <code>{task['reward']}$</code> ✨
+└─────────────────────┘
 
-    💰 <b>БАЛАНС</b>
-    <blockquote>💵 Основной: <code>{stats['balance']}$</code> 💎 </blockquote>
-    <blockquote>💎 Реферальный: <code>{stats['referral_balance']}$</code> 💰 </blockquote>
+👤 <b>ИГРОК</b>
+┌─────────────────────┐
+👨‍💻 @{stats['username']} ⭐
+🎮 Статус: <b>Активный</b>
+└─────────────────────┘
 
-    📊 <b>СТАТИСТИКА</b>
-    <blockquote>💳 Пополнено: <code>{stats['total_deposited']}$</code> 📈 </blockquote>
-    <blockquote>💸 Потрачено: <code>{stats['total_spent']}$</code> 📉 </blockquote>
-    <blockquote>🎲 Игр сыграно: <code>{stats['games_played']}</code> 🎪 </blockquote>
-    <blockquote>🎯 Винрейт: <code>{stats['win_rate']:.1f}%</code> 🏆 </blockquote>
+💰 <b>БАЛАНС</b>
+┌─────────────────────┐
+💵 Основной: <code>{stats['balance']}$</code> 💎
+💎 Реферальный: <code>{stats['referral_balance']}$</code> 💰
+💳 Всего средств: <code>{stats['balance'] + stats['referral_balance']}$</code> 🏆
+└─────────────────────┘
 
-    👥 <b>РЕФЕРАЛЫ</b>
-    <blockquote>🎯 Друзей: <code>{stats['referral_count']}</code> 👥 </blockquote>
-    <blockquote>✅ Активных: <code>{user_data[12] if user_data and len(user_data) > 12 else 0}</code> 👥 </blockquote>
-    <blockquote>💰 Заработано: <code>{stats['referral_balance']}$</code> 💵 </blockquote>
+📊 <b>ИГРОВАЯ СТАТИСТИКА</b>
+┌─────────────────────┐
+🎲 Игр сыграно: <code>{stats['games_played']}</code>
+💳 Пополнено: <code>{stats['total_deposited']}$</code> 📈
+💸 Потрачено: <code>{stats['total_spent']}$</code> 📉
+💰 Чистая прибыль: <code>{net_profit}$</code> {'📈' if net_profit > 0 else '📉'}
+🎯 Винрейт: <code>{stats['win_rate']:.1f}%</code> 🏆
+💰 Средняя ставка: <code>{avg_bet:.2f}$</code>
+💎 Прибыль на игру: <code>{profit_per_game:.2f}$</code>
+└─────────────────────┘
 
-    <i>Спасибо за игру с нами!</i>"""
+👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>
+┌─────────────────────┐
+🎯 Всего приглашено: <code>{stats['referral_count']}</code> 👥
+✅ Активных рефералов: <code>{user_data[12] if user_data and len(user_data) > 12 else 0}</code> 👥
+💰 Заработано: <code>{stats['referral_balance']}$</code> 💵
+└─────────────────────┘
+
+🎮 <i>Спасибо за игру с нами!</i>"""
 
     profile_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Детальная статистика", callback_data="detailed_stats")],
         [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main")]
     ])
 
@@ -1944,27 +2185,72 @@ async def detailed_stats_handler(callback_query: types.CallbackQuery):
     total_deposited = round(float(user_data[6]), 2) if user_data[6] is not None else 0
     total_spent = round(float(user_data[7]), 2) if user_data[7] is not None else 0
 
-    # Примерные расчеты (можно доработать)
+    # Вычисляем дополнительные метрики
+    net_profit = total_deposited - total_spent
     avg_bet = total_spent / max(1, games_played)
-    profit_per_game = (total_deposited - total_spent) / max(1, games_played)
+    profit_per_game = net_profit / max(1, games_played)
+    roi = (net_profit / max(1, total_deposited)) * 100 if total_deposited > 0 else 0
+
+    # Определяем уровень игрока
+    if total_deposited >= 1000:
+        player_level = "🏆 VIP Игрок"
+    elif total_deposited >= 500:
+        player_level = "💎 Опытный"
+    elif total_deposited >= 100:
+        player_level = "🥇 Активный"
+    elif games_played >= 50:
+        player_level = "🥈 Постоянный"
+    else:
+        player_level = "🥉 Начинающий"
+
+    # Определяем эффективность
+    if roi >= 50:
+        efficiency = "🚀 Отличная"
+    elif roi >= 20:
+        efficiency = "📈 Хорошая"
+    elif roi >= 0:
+        efficiency = "📊 Средняя"
+    else:
+        efficiency = "📉 Требует улучшения"
 
     stats_text = f"""📊 <b>ДЕТАЛЬНАЯ СТАТИСТИКА</b> 📊
 
-┌─ <b>🎮 ИГРОВАЯ СТАТИСТИКА</b> ─┐
-│ 🎲 Всего игр: <code>{games_played}</code>
-│ 💰 Средняя ставка: <code>{avg_bet:.2f}$</code>
-│ 📈 Прибыль на игру: <code>{profit_per_game:.2f}$</code>
-│ 🏆 Лучшая серия побед: <i>В разработке</i>
-└─────────────────────────────┘
+👤 <b>УРОВЕНЬ ИГРОКА</b>
+┌─────────────────────┐
+🏅 Статус: <b>{player_level}</b>
+📊 Эффективность: <b>{efficiency}</b>
+🎯 Рейтинг: <b>Топ {get_player_rank(user.id)}</b>
+└─────────────────────┘
 
-┌─ <b>💰 ФИНАНСОВЫЕ ПОКАЗАТЕЛИ</b> ─┐
-│ 💳 Общий депозит: <code>{total_deposited}$</code>
-│ 💸 Общие расходы: <code>{total_spent}$</code>
-│ 📊 ROI: <code>{(total_spent / max(1, total_deposited) * 100):.1f}%</code>
-│ 🎯 Эффективность: <i>Высокая</i>
-└─────────────────────────────┘
+📈 <b>ИГРОВАЯ АКТИВНОСТЬ</b>
+┌─────────────────────┐
+🎲 Всего игр: <code>{games_played}</code>
+💰 Средняя ставка: <code>{avg_bet:.2f}$</code>
+💎 Прибыль на игру: <code>{profit_per_game:.2f}$</code>
+🏆 Лучшая серия: <i>В разработке</i>
+📊 Винрейт: <code>{get_cached_user_stats(user.id)['win_rate']:.1f}%</code>
+└─────────────────────┘
 
-💡 <i>Статистика обновляется в реальном времени</i>"""
+💰 <b>ФИНАНСОВЫЕ ПОКАЗАТЕЛИ</b>
+┌─────────────────────┐
+💳 Общий депозит: <code>{total_deposited}$</code>
+💸 Общие расходы: <code>{total_spent}$</code>
+💰 Чистая прибыль: <code>{net_profit}$</code> {'📈' if net_profit > 0 else '📉'}
+📊 ROI: <code>{roi:.1f}%</code>
+💎 Эффективность: <b>{efficiency}</b>
+└─────────────────────┘
+
+🎯 <b>РЕФЕРАЛЬНЫЙ ПРОГРЕСС</b>
+┌─────────────────────┐
+👥 Приглашено друзей: <code>{user_data[4] or 0}</code>
+✅ Активных рефералов: <code>{user_data[12] or 0}</code>
+💰 Заработано: <code>{round(float(user_data[5]), 2) if user_data[5] else 0}$</code>
+└─────────────────────┘
+
+💡 <i>Статистика обновляется в реальном времени</i>
+
+🚀 <b>СОВЕТЫ ДЛЯ УЛУЧШЕНИЯ</b>
+{get_improvement_tips(roi, games_played, avg_bet)}"""
 
     stats_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📈 Графики прогресса", callback_data="progress_charts")],
@@ -1995,31 +2281,54 @@ async def progress_charts_handler(callback_query: types.CallbackQuery):
 
 # Обработчик кнопки "📊 Рейтинг"
 async def rating_handler(callback_query: types.CallbackQuery):
-    # Получаем топы из кэша
-    top_deposited, top_spent, top_referrals = await get_cached_tops()
+    # Получаем все топы из кэша
+    top_deposited, top_spent, top_referrals, top_wins = await get_cached_tops()
 
-    rating_text = "📊 Рейтинг игроков:\n\n"
+    rating_text = "📊 <b>РЕЙТИНГ ИГРОКОВ</b> 📊\n\n"
 
-    rating_text += "💰 Топ пополнивших:\n"
+    # Топ по пополнениям
+    rating_text += "💰 <b>ТОП ПОПОЛНИВШИХ</b>\n"
+    rating_text += "┌─────────────────────┐\n"
     for i, (username, amount) in enumerate(top_deposited, 1):
         username = username or f"User{i}"
-        rating_text += f"{i}. {username} - {amount}$\n"
+        medal = get_medal_emoji(i)
+        rating_text += f"{medal} <code>{i:2d}</code>. {username} - <code>{amount}$</code>\n"
+    rating_text += "└─────────────────────┘\n\n"
 
-    rating_text += "\n💸 Топ потративших:\n"
+    # Топ по тратам
+    rating_text += "💸 <b>ТОП ПОТРАТИВШИХ</b>\n"
+    rating_text += "┌─────────────────────┐\n"
     for i, (username, amount) in enumerate(top_spent, 1):
         username = username or f"User{i}"
-        rating_text += f"{i}. {username} - {amount}$\n"
+        medal = get_medal_emoji(i)
+        rating_text += f"{medal} <code>{i:2d}</code>. {username} - <code>{amount}$</code>\n"
+    rating_text += "└─────────────────────┘\n\n"
 
-    rating_text += "\n👥 Топ пригласивших:\n"
+    # Топ по рефералам
+    rating_text += "👥 <b>ТОП ПРИГЛАСИВШИХ</b>\n"
+    rating_text += "┌─────────────────────┐\n"
     for i, (username, count) in enumerate(top_referrals, 1):
         username = username or f"User{i}"
-        rating_text += f"{i}. {username} - {count} чел.\n"
+        medal = get_medal_emoji(i)
+        rating_text += f"{medal} <code>{i:2d}</code>. {username} - <code>{count}</code> чел.\n"
+    rating_text += "└─────────────────────┘\n\n"
+
+    # Топ по выигрышам
+    rating_text += "🏆 <b>ТОП ВЫИГРЫШЕЙ</b>\n"
+    rating_text += "┌─────────────────────┐\n"
+    for i, (username, amount) in enumerate(top_wins, 1):
+        username = username or f"User{i}"
+        medal = get_medal_emoji(i)
+        rating_text += f"{medal} <code>{i:2d}</code>. {username} - <code>{amount}$</code>\n"
+    rating_text += "└─────────────────────┘\n\n"
+
+    rating_text += "🎮 <i>Обновляется каждые 2 минуты</i>"
 
     try:
-        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=rating_text)
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=rating_text, parse_mode="HTML")
         await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
     except:
-        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=rating_text, reply_markup=get_back_button())
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=rating_text, reply_markup=get_back_button(), parse_mode="HTML")
     await callback_query.answer()
 
 # Обработчик кнопки "📈 Шансы"
@@ -4318,7 +4627,7 @@ async def deposit_handler(callback_query: types.CallbackQuery):
  ⚡ <b>Мгновенное зачисление средств</b>
  🔒 <i>Безопасные платежи через Crypto Bot</i>
 
- 💰 <b>Минимальная сумма:</b> 1$
+ 💰 <b>Минимальная сумма:</b> 5$
  💎 <b>Максимальная сумма:</b> 1000$
 
  <i>Поддерживаемые валюты: USDT, BTC, ETH, TON и другие</i>
@@ -4779,7 +5088,7 @@ async def withdraw_handler(callback_query: types.CallbackQuery, state: FSMContex
 
     📝 Введите сумму для вывода в $:
 
-    <i>Минимальная сумма: 5$</i>
+    <i>Минимальная сумма: 1$</i>
     <i>Обязательно: сыграть хотя бы 1 игру</i>
     <i>Средства будут отправлены на ваш баланс в @CryptoBot</i>"""
 
@@ -5133,6 +5442,10 @@ async def process_payment_async(telegram_id, amount, invoice_id=None):
         await async_update_balance(telegram_id, amount)
         await invalidate_balance_cache(telegram_id)
 
+        # Принудительное сохранение после начисления средств
+        await async_db._force_checkpoint()
+        print(f"💾 База данных сохранена после начисления {amount}$ пользователю {telegram_id}")
+
         # Проверяем реферер
         user_data = await async_get_user(telegram_id)
         if (user_data and len(user_data) > 9 and user_data[9] and  # referrer_id exists
@@ -5143,7 +5456,10 @@ async def process_payment_async(telegram_id, amount, invoice_id=None):
             await async_update_referral_balance(referrer_id, referral_bonus)
             # Отмечаем, что бонус уже начислен для этого реферала
             await async_mark_referral_bonus_given(telegram_id)
+            # Принудительное сохранение после реферального бонуса
+            await async_db._force_checkpoint()
             print(f"Реферальный бонус начислен асинхронно: referrer_id={referrer_id}, bonus={referral_bonus}, deposit_amount={amount}")
+            print(f"💾 База данных сохранена после реферального бонуса")
 
         # Получаем информацию о сообщении платежа
         message_id = None
@@ -5873,6 +6189,77 @@ async def promo_code_handler(message: types.Message, state: FSMContext):
 
 
 
+# Обработчик рефералов
+async def referral_handler(callback_query: types.CallbackQuery):
+    """Показать реферальную информацию пользователя"""
+    user = callback_query.from_user
+
+    # Получаем данные пользователя
+    user_data = await async_get_user(user.id)
+    if not user_data:
+        await safe_callback_answer(callback_query, "❌ Пользователь не найден", show_alert=True)
+        return
+
+    telegram_id = user_data[1]
+    username = user_data[2] or f"ID:{telegram_id}"
+    referral_count = user_data[4] if user_data[4] is not None else 0
+    referral_balance = round(float(user_data[5]), 2) if user_data[5] is not None else 0
+    active_referrals_count = user_data[12] if len(user_data) > 12 and user_data[12] is not None else 0
+
+    # Получаем username бота
+    try:
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username or "Testbotcazikbot"
+    except:
+        bot_username = "Testbotcazikbot"
+
+    # Генерируем короткий реферальный код
+    try:
+        short_code = await async_create_referral_code(telegram_id)
+        # Генерируем реферальную ссылку с коротким кодом
+        referral_link = f"t.me/{bot_username}?start={short_code}"
+
+        # Проверяем, что код действительно сохранился в БД
+        check_telegram_id = await async_get_telegram_id_by_referral_code(short_code)
+        if check_telegram_id != telegram_id:
+            # Fallback на старый формат
+            referral_link = f"t.me/{bot_username}?start={telegram_id}"
+    except Exception as e:
+        print(f"❌ Ошибка генерации короткого кода: {e}")
+        # Fallback на старый формат
+        referral_link = f"t.me/{bot_username}?start={telegram_id}"
+
+    referral_text = f"""👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>
+
+🎯 <b>Ваша реферальная ссылка:</b>
+<code>{referral_link}</code>
+
+📊 <b>Статистика:</b>
+• Приглашенных: <code>{referral_count}</code>
+• <i>Активных рефералов:</i> <code>{active_referrals_count}</code>
+• <i>Реферальный баланс:</i> <code>{referral_balance}$</code>
+
+💰 <b>Как это работает:</b>
+<i>1. Поделитесь своей ссылкой с друзьями</i>
+<i>2. Когда друг пополнит баланс на 2$+, вы получите</i> {REFERRAL_BONUS}$
+<i>3. Деньги можно вывести на свой кошелек</i>
+
+🎁 <b>Текущее задание дня:</b> {get_daily_task()['description']}
+💎 Награда: {get_daily_task()['reward']}$"""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=f"https://t.me/share/url?url={referral_link}&text=🎰%20Присоединяйся%20к%20VanishCasino!%20Получи%20бонус%20за%20регистрацию!")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=referral_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=referral_text, reply_markup=keyboard, parse_mode="HTML")
+
+    await safe_callback_answer(callback_query)
+
 # Заглушка для игр в разработке
 async def game_placeholder_handler(callback_query: types.CallbackQuery):
     game = callback_query.data.split("_")[1]
@@ -5886,23 +6273,23 @@ async def game_placeholder_handler(callback_query: types.CallbackQuery):
 def setup_handlers():
     if dp:
         # Команды
-        dp.message.register(start_command, F.text.in_(['/start', '/restart']))
-        dp.message.register(give_command, F.text.startswith('/give'))
-        dp.message.register(panel_command, F.text == '/panel')
-        dp.message.register(tasks_command, F.text == '/tasks')
-        dp.message.register(setgroup_command, F.text.startswith('/setgroup'))
-        dp.message.register(setvip_command, F.text.startswith('/setvip'))
-        dp.message.register(getgroup_command, F.text == '/getgroup')
-        dp.message.register(getvip_command, F.text == '/getvip')
-        dp.message.register(getgroups_command, F.text == '/getgroups')
-        dp.message.register(createpromo_command, F.text.startswith('/createpromo'))
-        dp.message.register(listpromo_command, F.text == '/listpromo')
-        dp.message.register(logs_command, F.text == '/logs')
-        dp.message.register(stats_command, F.text == '/stats')
-        dp.message.register(set0_command, F.text == '/set0')
-        dp.message.register(set_command, F.text.startswith('/set'))
-        dp.message.register(chat_command, F.text.startswith('/chat'))
-        dp.message.register(fake_withdraw_command, F.text.startswith('/fake'))
+        dp.message.register(start_command, Command(commands=['start', 'restart']))
+        dp.message.register(give_command, Command(commands=['give']))
+        dp.message.register(panel_command, Command(commands=['panel']))
+        dp.message.register(tasks_command, Command(commands=['tasks']))
+        dp.message.register(setgroup_command, Command(commands=['setgroup']))
+        dp.message.register(setvip_command, Command(commands=['setvip']))
+        dp.message.register(getgroup_command, Command(commands=['getgroup']))
+        dp.message.register(getvip_command, Command(commands=['getvip']))
+        dp.message.register(getgroups_command, Command(commands=['getgroups']))
+        dp.message.register(createpromo_command, Command(commands=['createpromo']))
+        dp.message.register(listpromo_command, Command(commands=['listpromo']))
+        dp.message.register(logs_command, Command(commands=['logs']))
+        dp.message.register(stats_command, Command(commands=['stats']))
+        dp.message.register(set0_command, Command(commands=['set0']))
+        dp.message.register(set_command, Command(commands=['set']))
+        dp.message.register(chat_command, Command(commands=['chat']))
+        dp.message.register(fake_withdraw_command, Command(commands=['fake']))
 
         # Callback кнопок
         dp.callback_query.register(back_to_main, F.data == "back_to_main")
@@ -6007,4 +6394,3 @@ def setup_handlers():
 
 # Вызываем регистрацию обработчиков
 setup_handlers()
-

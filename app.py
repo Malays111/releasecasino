@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 async def main():
     """Основная функция для запуска в продакшене"""
     try:
-        logger.info("🚀 Запуск VanishCasino Bot в продакшене...")
+        logger.info("🚀 Запуск Vanish Casino Bot в продакшене...")
         await run_bot()
     except KeyboardInterrupt:
         logger.info("🛑 Бот остановлен пользователем")
