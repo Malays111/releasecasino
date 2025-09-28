@@ -854,7 +854,7 @@ async def get_welcome_text(user):
     # Получаем задание дня
     task = get_daily_task()
 
-    welcome_text = f"""🎰 <b>Test Casino</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
+    welcome_text = f"""🎰 <b>VanishCasino</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
 
  {greeting}!
 
@@ -6393,4 +6393,5 @@ def setup_handlers():
 
 
 # Вызываем регистрацию обработчиков
+
 setup_handlers()
