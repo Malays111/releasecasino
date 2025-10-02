@@ -924,3 +924,180 @@ class AsyncDatabase:
         except Exception as e:
             print(f"❌ Ошибка поиска кода {short_code}: {e}")
             return None
+
+    async def get_casino_stats(self) -> Tuple[int, int, int, float, float, int]:
+        """Получение общей статистики казино"""
+        # Всего игр
+        total_games_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE action IN ('duel_win', 'duel_lose', 'dice_win', 'dice_lose', 'basketball_win', 'basketball_lose', 'slots_win', 'slots_lose', 'lottery_win', 'lottery_lose', 'wheel_win', 'wheel_lose')",
+            fetchone=True)
+        total_games = total_games_result[0] if total_games_result else 0
+
+        # Побед
+        wins_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            fetchone=True)
+        wins = wins_result[0] if wins_result else 0
+
+        # Поражений
+        losses_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            fetchone=True)
+        losses = losses_result[0] if losses_result else 0
+
+        # Выплачено
+        paid_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            fetchone=True)
+        paid = paid_result[0] if paid_result else 0
+
+        # Проиграно
+        lost_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            fetchone=True)
+        lost = lost_result[0] if lost_result else 0
+
+        # Всего игроков
+        users_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM users",
+            fetchone=True)
+        total_users = users_result[0] if users_result else 0
+
+        return total_games, wins, losses, paid, lost, total_users
+
+    async def get_daily_stats(self) -> Tuple[int, int, int, float, float]:
+        """Получение ежедневной статистики казино"""
+        today = date.today().isoformat()
+
+        # Игр сегодня
+        games_today_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE DATE(created_at) = ? AND action IN ('duel_win', 'duel_lose', 'dice_win', 'dice_lose', 'basketball_win', 'basketball_lose', 'slots_win', 'slots_lose', 'lottery_win', 'lottery_lose', 'wheel_win', 'wheel_lose')",
+            (today,), fetchone=True)
+        games_today = games_today_result[0] if games_today_result else 0
+
+        # Побед сегодня
+        wins_today_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE DATE(created_at) = ? AND action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            (today,), fetchone=True)
+        wins_today = wins_today_result[0] if wins_today_result else 0
+
+        # Поражений сегодня
+        losses_today_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE DATE(created_at) = ? AND action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            (today,), fetchone=True)
+        losses_today = losses_today_result[0] if losses_today_result else 0
+
+        # Выплачено сегодня
+        paid_today_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE DATE(created_at) = ? AND action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            (today,), fetchone=True)
+        paid_today = paid_today_result[0] if paid_today_result else 0
+
+        # Проиграно сегодня
+        lost_today_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE DATE(created_at) = ? AND action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            (today,), fetchone=True)
+        lost_today = lost_today_result[0] if lost_today_result else 0
+
+        return games_today, wins_today, losses_today, paid_today, lost_today
+
+    async def get_user_stats(self, user_id: int) -> Tuple[int, int, int, float, float, float, int]:
+        """Получение статистики пользователя"""
+        # Всего игр
+        total_games_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE telegram_id = ? AND action IN ('duel_win', 'duel_lose', 'dice_win', 'dice_lose', 'basketball_win', 'basketball_lose', 'slots_win', 'slots_lose', 'lottery_win', 'lottery_lose', 'wheel_win', 'wheel_lose')",
+            (user_id,), fetchone=True)
+        total_games = total_games_result[0] if total_games_result else 0
+
+        # Побед
+        wins_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE telegram_id = ? AND action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            (user_id,), fetchone=True)
+        wins = wins_result[0] if wins_result else 0
+
+        # Поражений
+        losses_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM user_logs WHERE telegram_id = ? AND action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            (user_id,), fetchone=True)
+        losses = losses_result[0] if losses_result else 0
+
+        # Выплачено
+        paid_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE telegram_id = ? AND action IN ('duel_win', 'dice_win', 'basketball_win', 'slots_win', 'lottery_win', 'wheel_win')",
+            (user_id,), fetchone=True)
+        paid = paid_result[0] if paid_result else 0
+
+        # Проиграно
+        lost_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE telegram_id = ? AND action IN ('duel_lose', 'dice_lose', 'basketball_lose', 'slots_lose', 'lottery_lose', 'wheel_lose')",
+            (user_id,), fetchone=True)
+        lost = lost_result[0] if lost_result else 0
+
+        # Реферальный заработок
+        referral_earned_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(amount), 0) FROM user_logs WHERE telegram_id = ? AND action = 'referral_bonus'",
+            (user_id,), fetchone=True)
+        referral_earned = referral_earned_result[0] if referral_earned_result else 0
+
+        # Количество рефералов
+        referral_count = await self.get_referral_count(user_id)
+
+        return total_games, wins, losses, paid, lost, referral_earned, referral_count
+
+    async def get_referral_count(self, telegram_id: int) -> int:
+        """Получение количества рефералов пользователя"""
+        result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(*) FROM users WHERE referrer_id = (SELECT id FROM users WHERE telegram_id = ?)",
+            (telegram_id,), fetchone=True)
+        return result[0] if result else 0
+
+    async def get_all_users(self) -> List[Tuple[int, str]]:
+        """Получение всех пользователей для рассылки"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT telegram_id, username FROM users",
+            fetchall=True)
+
+    async def get_all_settings(self) -> Dict[str, str]:
+        """Получение всех текстовых настроек"""
+        rows = await asyncio.to_thread(self._execute_query,
+            "SELECT setting_key, setting_value FROM text_settings", fetchall=True)
+        return {row[0]: row[1] for row in rows}
+
+    async def get_all_users_with_balances(self) -> List[Tuple[str, float]]:
+        """Получение всех пользователей с их балансами для статистики проекта"""
+        return await asyncio.to_thread(self._execute_query,
+            "SELECT username, balance FROM users ORDER BY balance DESC",
+            fetchall=True)
+
+    async def get_casino_total_balance(self) -> float:
+        """Получение общего баланса казино (сумма всех балансов пользователей)"""
+        result = await asyncio.to_thread(self._execute_query,
+            "SELECT COALESCE(SUM(balance + COALESCE(referral_balance, 0)), 0) FROM users",
+            fetchone=True)
+        return result[0] if result else 0.0
+
+    async def get_visit_stats(self) -> Tuple[int, int, int]:
+        """Получение статистики посещаемости: (за сегодня, за неделю, за все время)"""
+        from datetime import datetime, timedelta
+
+        # За все время
+        total_visits_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(DISTINCT telegram_id) FROM user_logs",
+            fetchone=True)
+        total_visits = total_visits_result[0] if total_visits_result else 0
+
+        # За сегодня
+        today = datetime.now().date()
+        today_visits_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(DISTINCT telegram_id) FROM user_logs WHERE DATE(created_at) = ?",
+            (today.isoformat(),), fetchone=True)
+        today_visits = today_visits_result[0] if today_visits_result else 0
+
+        # За неделю
+        week_ago = datetime.now() - timedelta(days=7)
+        week_visits_result = await asyncio.to_thread(self._execute_query,
+            "SELECT COUNT(DISTINCT telegram_id) FROM user_logs WHERE created_at >= ?",
+            (week_ago.isoformat(),), fetchone=True)
+        week_visits = week_visits_result[0] if week_visits_result else 0
+
+        return today_visits, week_visits, total_visits

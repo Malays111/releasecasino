@@ -7,7 +7,7 @@ CRYPTO_BOT_API = "https://pay.crypt.bot/api"
 
 # Кнопки пополнения
 DEPOSIT_AMOUNTS = [5, 10, 15, 20]
-CASINO_NAME = "VanishCasino"
+CASINO_NAME = "Vanish Casino"
 
 # Поддерживаемые криптовалюты (API 1.5.1)
 SUPPORTED_ASSETS = ["USDT", "BTC", "ETH", "LTC", "TON", "USDC", "BNB", "TRX"]
@@ -30,6 +30,17 @@ BASKETBALL_FAQ_URL = "https://t.me/VanishCasino/12"  # Замените на с�
 SLOTS_FAQ_URL = "https://t.me/VanishCasino/13"  # Замените на ссылку для слотов
 LOTTERY_FAQ_URL = "https://t.me/VanishCasino/15"  # FAQ для лотереи
 WHEEL_FAQ_URL = "https://t.me/VanishCasino/16"  # FAQ для колеса фортуны
+MINES_FAQ_URL = "https://t.me/VanishCasino/17"  # FAQ для игры Мины
+
+# Настройки игры Мины
+MINES_SETTINGS = {
+    'field_size': 5,  # Размер поля 5x5
+    'min_bombs': 3,   # Минимальное количество бомб
+    'max_bombs': 5,  # Максимальное количество бомб
+    'total_cells': 25,  # Общее количество ячеек (5x5)
+    'base_multiplier': 1.5,  # Базовый множитель
+    'first_click_safe': False,  # Первый клик всегда безопасен
+}
 
 # Ссылки на группы
 GROUPS = [
@@ -39,10 +50,13 @@ GROUPS = [
 ]
 
 # Фото
-BACKGROUND_IMAGE_URL = "https://www.dropbox.com/scl/fi/yq0rqk375v757xka05ov8/1-1.jpg?rlkey=pqy5wkgnq7gtem283nki132j1&st=gvnrbgw0&dl=0"
+BACKGROUND_IMAGE_URL = "https://www.dropbox.com/scl/fi/ngn2msndmcl7xxbpuqiwu/1759408557-1.png?rlkey=m2c5w58ldnpwcj86wprp4uhqf&st=o31gmoq5&dl=0"
 
 # Админы
 ADMIN_IDS = [8217088275, 1076328217]  # Замените на ID админов
+
+# Группа для уведомлений о пополнениях
+ADMIN_GROUP_ID = -4755964680  # ID группы админов для уведомлений о пополнениях
 
 # Реферальная система
 REFERRAL_BONUS = 1  # 0.3$ за каждого реферала, который пополнил баланс на сумму >= REFERRAL_MIN_DEPOSIT
@@ -68,6 +82,7 @@ DEFAULT_GAME_SETTINGS = {
     'slots_win_chance': 4.0,
     'lottery_win_chance': 1.0,   # Шанс выигрыша в лотерее
     'wheel_win_chance': 2.0,     # Шанс выигрыша в колесе фортуны
+    'mines_win_chance': 15.0,    # Шанс выигрыша в минах (базовый)
 
     # Множители выигрыша
     'duel_multiplier': 1.8,
@@ -76,6 +91,7 @@ DEFAULT_GAME_SETTINGS = {
     'slots_multiplier': 8.0,
     'lottery_multiplier': 4.0,   # x10 для лотереи
     'wheel_multiplier': 5.0,      # x5 для колеса фортуны
+    'mines_multiplier': 1.5,     # Базовый множитель для мин
 }
 
 # Экспорт новых констант
@@ -86,8 +102,8 @@ __all__ = [
     "INVOICE_EXPIRES_IN", "MIN_DEPOSIT", "MAX_DEPOSIT", "MIN_WITHDRAWAL",
     "DUEL_FAQ_URL", "DICE_FAQ_URL", "BASKETBALL_FAQ_URL",
     "SLOTS_FAQ_URL",
-    "LOTTERY_FAQ_URL", "WHEEL_FAQ_URL",
-    "GROUPS", "BACKGROUND_IMAGE_URL", "ADMIN_IDS",
+    "LOTTERY_FAQ_URL", "WHEEL_FAQ_URL", "MINES_FAQ_URL",
+    "GROUPS", "BACKGROUND_IMAGE_URL", "ADMIN_IDS", "ADMIN_GROUP_ID",
     "REFERRAL_BONUS", "REFERRAL_MIN_DEPOSIT", "DAILY_TASKS",
-    "DEFAULT_GAME_SETTINGS"
+    "DEFAULT_GAME_SETTINGS", "MINES_SETTINGS"
 ]

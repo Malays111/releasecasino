@@ -8,10 +8,10 @@ from config import (
     SUPPORTED_ASSETS, DEFAULT_ASSET, DEFAULT_CURRENCY_TYPE, DEFAULT_FIAT,
     INVOICE_EXPIRES_IN, MIN_DEPOSIT, MAX_DEPOSIT, MIN_WITHDRAWAL,
     DUEL_FAQ_URL, DICE_FAQ_URL, BASKETBALL_FAQ_URL, SLOTS_FAQ_URL,
-    LOTTERY_FAQ_URL, WHEEL_FAQ_URL,
+    LOTTERY_FAQ_URL, WHEEL_FAQ_URL, MINES_FAQ_URL,
     BACKGROUND_IMAGE_URL,
-    ADMIN_IDS, REFERRAL_BONUS, REFERRAL_MIN_DEPOSIT, DAILY_TASKS, GROUPS,
-    DEFAULT_GAME_SETTINGS
+    ADMIN_IDS, ADMIN_GROUP_ID, REFERRAL_BONUS, REFERRAL_MIN_DEPOSIT, DAILY_TASKS, GROUPS,
+    DEFAULT_GAME_SETTINGS, MINES_SETTINGS
 )
 
 # URL изображений для результатов игр
@@ -32,6 +32,27 @@ bot = None
 dp = None
 results_group_id = None  # ID группы для отправки результатов игр
 vip_group_id = None  # ID VIP группы для отправки выплат
+
+# Фейковые ставки
+fake_games_enabled = False
+fake_games_interval = 10  # секунды между фейковыми играми
+fake_bets_min = 10  # минимальная сумма ставки
+fake_bets_max = 25  # максимальная сумма ставки
+fake_games_task = None  # задача для автоматической отправки
+
+# Рассылка сообщений
+broadcast_enabled = False  # включена ли автоматическая рассылка
+broadcast_message = None  # сообщение для рассылки
+broadcast_task = None  # задача для автоматической рассылки
+broadcast_interval = 900  # интервал рассылки в секундах (15 минут)
+
+# Функция для безопасного получения текущего интервала
+def get_fake_games_interval():
+    return fake_games_interval
+
+# Функция для безопасного получения текущего статуса фейковых игр
+def get_fake_games_status():
+    return fake_games_enabled
 
 # Кэш топов
 top_deposited_cache = []
@@ -137,6 +158,103 @@ async def send_game_result_to_group(game_name, username, bet, result_text, winni
     except Exception as e:
         print(f"Ошибка отправки в группу: {e}")
 
+# Функция отправки уведомления о пополнении в группу админов
+async def send_deposit_notification_to_admins(username, telegram_id, amount, payment_method="CryptoBot"):
+    """Отправка уведомления о пополнении в группу админов"""
+    if not ADMIN_GROUP_ID:
+        print("❌ ADMIN_GROUP_ID не установлен")
+        # Логируем отсутствие настройки группы админов
+        await async_log_action(0, "admin_notification_error", 0, f"ADMIN_GROUP_ID не установлен для уведомления о пополнении {amount}$ пользователя @{username}")
+        return
+
+    try:
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        notification_text = f"""💰 <b>ПОПОЛНЕНИЕ БАЛАНСА</b>
+
+👤 Пользователь: @{username}
+🆔 Telegram ID: <code>{telegram_id}</code>
+💵 Сумма: <code>{amount}$</code>
+💳 Способ оплаты: {payment_method}
+⏰ Время: {current_time}
+
+💎 Баланс успешно пополнен!"""
+
+        # Отправляем без ожидания
+        asyncio.create_task(
+            bot.send_message(chat_id=ADMIN_GROUP_ID, text=notification_text, parse_mode="HTML")
+        )
+
+        # Логируем успешную отправку уведомления
+        await async_log_action(telegram_id, "deposit_notification_sent", amount, f"Уведомление отправлено в группу админов о пополнении {amount}$")
+
+        print(f"✅ Уведомление о пополнении отправлено в группу админов: пользователь @{username}, сумма {amount}$")
+
+    except Exception as e:
+        # Логируем ошибку отправки уведомления
+        await async_log_action(telegram_id, "deposit_notification_error", amount, f"Ошибка отправки уведомления в группу админов: {e}")
+        print(f"❌ Ошибка отправки уведомления о пополнении в группу админов: {e}")
+
+# Функция отправки результата игры после анимации
+async def send_game_result_after_animation(group_id, game_name, user, bet, result_text, game_result, is_win):
+    """Отправка результата игры в группу после завершения анимации"""
+    try:
+        # Ждем завершения анимации (задержка для всех игр)
+        await asyncio.sleep(5)  # 5 секунд задержки после анимации
+
+        username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
+
+        # Определяем результат для группы
+        if "+" in game_result:
+            winnings = game_result.split()[-1]
+            winnings_label = "Выигрыш"
+        elif "-" in game_result:
+            winnings = f"-{bet}$"
+            winnings_label = "Проигрыш"
+        else:
+            winnings = "0$"
+            winnings_label = "Возврат"
+
+        group_text = f"""📎 Игра: {game_name}
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}"""
+
+        photo_url = WIN_IMAGE_URL if is_win else LOSE_IMAGE_URL
+
+        await bot.send_photo(chat_id=group_id, photo=photo_url, caption=group_text)
+        print(f"Результат {game_name} отправлен в группу после анимации")
+
+    except Exception as e:
+        print(f"Ошибка отправки в группу после анимации: {e}")
+
+# Функция отправки результатов лотереи после задержки
+async def send_lottery_results_after_delay(group_id, draw_number, winning_numbers_str, total_tickets_count, winners_count, total_prize_pool_amount, winners):
+    """Отправка результатов лотереи в группу после небольшой задержки"""
+    try:
+        # Ждем 3 секунды для завершения всех процессов
+        await asyncio.sleep(3)
+
+        result_text = f"""🎲 <b>РЕЗУЛЬТАТЫ ЛОТЕРЕИ #{draw_number}</b>
+
+🎯 Выигрышные номера: <code>{winning_numbers_str}</code>
+🎫 Всего билетов: <code>{total_tickets_count}</code>
+👑 Победителей: <code>{winners_count}</code>
+💰 Общий призовой фонд: <code>{total_prize_pool_amount}$</code>
+
+{'🏆 Есть победители!' if winners else '😔 Победителей нет'}"""
+
+        await bot.send_message(
+            chat_id=group_id,
+            text=result_text,
+            parse_mode="HTML"
+        )
+        print("📊 Результаты лотереи отправлены в группу после задержки")
+
+    except Exception as e:
+        print(f"❌ Ошибка отправки результатов лотереи в группу: {e}")
+
 # Асинхронные функции БД (используем async_db напрямую)
 async def async_get_user(telegram_id):
     """Получение пользователя из БД"""
@@ -185,6 +303,42 @@ async def async_save_game_setting(key, value):
 async def async_save_setting(key, value):
     """Сохранение текстовой настройки"""
     await async_db.save_setting(key, value)
+
+async def async_save_fake_games_interval(interval):
+    """Сохранение интервала фейковых игр"""
+    await async_db.save_setting('fake_games_interval', str(interval))
+
+async def async_save_fake_bets_range(min_bet, max_bet):
+    """Сохранение диапазона ставок фейковых игр"""
+    await async_db.save_setting('fake_bets_min', str(min_bet))
+    await async_db.save_setting('fake_bets_max', str(max_bet))
+
+async def async_load_fake_games_settings():
+    """Загрузка настроек фейковых игр"""
+    global fake_games_interval, fake_bets_min, fake_bets_max
+
+    try:
+        # Загружаем интервал фейковых игр
+        interval_str = await async_get_setting('fake_games_interval', '10')
+        fake_games_interval = int(interval_str)
+        print(f"Загружен интервал фейковых игр: {fake_games_interval}")
+
+        # Загружаем минимальную ставку
+        min_bet_str = await async_get_setting('fake_bets_min', '10')
+        fake_bets_min = float(min_bet_str)
+        print(f"Загружена мин. ставка фейковых игр: {fake_bets_min}")
+
+        # Загружаем максимальную ставку
+        max_bet_str = await async_get_setting('fake_bets_max', '25')
+        fake_bets_max = float(max_bet_str)
+        print(f"Загружена макс. ставка фейковых игр: {fake_bets_max}")
+
+    except Exception as e:
+        print(f"Ошибка загрузки настроек фейковых игр: {e}")
+        # Используем значения по умолчанию
+        fake_games_interval = 10
+        fake_bets_min = 10
+        fake_bets_max = 25
 
 async def async_create_withdrawal(user_id, amount, wallet_address):
     """Создание заявки на вывод"""
@@ -263,6 +417,23 @@ async def async_get_pending_payments(telegram_id):
 async def async_get_payment_amount_by_invoice(invoice_id):
     """Получение суммы платежа по invoice_id"""
     return await async_db.get_payment_amount_by_invoice(invoice_id)
+
+async def async_get_all_payments(limit=50):
+    """Получение всех платежей из базы данных"""
+    return await asyncio.to_thread(async_db._execute_query,
+        "SELECT p.id, p.user_id, p.amount, p.crypto_bot_invoice_id, p.status, p.created_at, u.username, u.telegram_id FROM payments p LEFT JOIN users u ON p.user_id = u.id ORDER BY p.created_at DESC LIMIT ?",
+        (limit,), fetchall=True)
+
+async def async_delete_payment(payment_id):
+    """Удаление платежа по ID"""
+    await asyncio.to_thread(async_db._execute_query,
+        "DELETE FROM payments WHERE id = ?",
+        (payment_id,), commit=True)
+
+async def async_delete_all_payments():
+    """Удаление всех платежей"""
+    await asyncio.to_thread(async_db._execute_query,
+        "DELETE FROM payments", commit=True)
 
 async def async_get_setting(key, default_value=None):
     """Получение текстовой настройки"""
@@ -592,6 +763,79 @@ async def queue_group_message(message_data):
     """Добавление сообщения в очередь для отправки в группу"""
     await group_message_queue.put(message_data)
 
+# Функция отправки фейковой игры
+async def send_fake_game():
+    """Отправляет фейковую игру в группу результатов"""
+    if not results_group_id or not fake_games_enabled:
+        print(f"Фейковая игра не отправлена: results_group_id={results_group_id}, fake_games_enabled={fake_games_enabled}")
+        return
+
+    # Проверяем, что results_group_id является числом
+    try:
+        group_id_int = int(results_group_id)
+        print(f"Отправка фейковой игры в группу {group_id_int}")
+    except (ValueError, TypeError):
+        print(f"Неверный формат results_group_id: {results_group_id}")
+        return
+
+    try:
+        # Выбираем случайную игру
+        games = ["Дуэль", "Кубики", "Баскетбол", "Слоты", "Лотерея", "Колесо фортуны"]
+        game_name = random.choice(games)
+
+        # Генерируем случайную ставку
+        bet = round(random.uniform(fake_bets_min, fake_bets_max), 2)
+
+        # Генерируем фейкового пользователя
+        fake_usernames = ["johndoe", "sarahsmith", "mikejohnson", "emilydavis", "alexbrown", "jessicawilson", "davidmartin", "lisagarcia", "chrisanderson", "amandataylor", "stevemiller", "rachelmoore", "kevinthomas", "nicolewhite", "brianclark", "heatherlewis", "jasonwalker", "melissahall", "aaronallen", "laurayoung", "ryanhernandez", "kellyking", "ericwright", "christinalopez", "brandonhill", "tiffanygreen", "justinadams", "ambernelson", "nathanbaker", "ashleycarter", "patrickmitchell", "stephaniemorgan", "seanpeterson", "jennifercooper", "travisreed", "heatherbailey", "coreybell", "daniellebrooks", "carlosgonzalez", "erinross", "shawnrussell", "tanyafoster", "louisbutler", "aprilhoward", "codyjames", "kristenlong", "dustinwood", "monicaprice", "garrettwatson", "mindybrooks", "dont_trump", "scam_nft", "fake_crypto", "bot_farmer", "pump_dump", "rug_puller", "moon_boy", "diamond_hands", "paper_hands", "crypto_scam", "nft_flip", "defi_degen", "whale_alert", "bear_market", "bull_trap", "fake_news", "crypto_fomo", "hodl_gang", "lambo_dream", "to_the_moon"]
+        username = random.choice(fake_usernames)
+
+        # Определяем результат (фейковые игры всегда выигрывают для демонстрации)
+        result_text = "Вы выиграли!"
+        winnings_label = "Выигрыш"
+        winnings = bet * random.choice([1.5, 2.0, 3.0, 5.0])  # случайный множитель
+
+        # Отправляем в группу
+        group_text = f"""📎 Игра: {game_name}
+📱 Пользователь: {username}
+💰 Ставка: {bet}$
+⚡Результат: {result_text}
+💲 {winnings_label}: {winnings}$"""
+
+        photo_url = WIN_IMAGE_URL
+
+        await bot.send_photo(chat_id=group_id_int, photo=photo_url, caption=group_text)
+        print(f"Фейковая игра отправлена: {game_name}, ставка {bet}$, пользователь {username}")
+
+    except Exception as e:
+        print(f"Ошибка отправки фейковой игры: {e}")
+
+# Функция запуска автоматической отправки фейковых игр
+async def start_fake_games():
+    """Запускает автоматическую отправку фейковых игр"""
+    global fake_games_task, fake_games_enabled
+    fake_games_enabled = True
+    if fake_games_task and not fake_games_task.done():
+        fake_games_task.cancel()
+
+    async def fake_games_loop():
+        while fake_games_enabled:
+            await send_fake_game()
+            await asyncio.sleep(fake_games_interval)
+
+    fake_games_task = asyncio.create_task(fake_games_loop())
+    print(f"Автоматическая отправка фейковых игр запущена (интервал: {fake_games_interval} сек)")
+
+# Функция остановки автоматической отправки фейковых игр
+async def stop_fake_games():
+    """Останавливает автоматическую отправку фейковых игр"""
+    global fake_games_task, fake_games_enabled
+    fake_games_enabled = False
+    if fake_games_task and not fake_games_task.done():
+        fake_games_task.cancel()
+        fake_games_task = None
+    print("Автоматическая отправка фейковых игр остановлена")
+
 # Функция проверки выполнения задания
 def check_daily_task_completion(user_data, task):
     if task["type"] == "referrals":
@@ -644,6 +888,9 @@ async def load_initial_settings():
             print("   /setvip <ID_VIP_группы>")
             print("   Или отправьте эту команду в нужной VIP группе")
             vip_group_id = None
+
+        # Загрузка настроек фейковых игр
+        await async_load_fake_games_settings()
     except Exception as e:
         print(f"Ошибка загрузки настроек: {e}")
 
@@ -657,6 +904,7 @@ BASKETBALL_WIN_CHANCE = settings.get('basketball_win_chance', 10.0)
 SLOTS_WIN_CHANCE = settings.get('slots_win_chance', 4.0)
 LOTTERY_WIN_CHANCE = settings.get('lottery_win_chance', 15.0)
 WHEEL_WIN_CHANCE = settings.get('wheel_win_chance', 25.0)
+MINES_WIN_CHANCE = settings.get('mines_win_chance', 15.0)
 
 # Множители выигрыша
 DUEL_MULTIPLIER = settings.get('duel_multiplier', 1.8)
@@ -665,6 +913,14 @@ BASKETBALL_MULTIPLIER = settings.get('basketball_multiplier', 1.5)
 SLOTS_MULTIPLIER = settings.get('slots_multiplier', 8.0)
 LOTTERY_MULTIPLIER = settings.get('lottery_multiplier', 10.0)
 WHEEL_MULTIPLIER = settings.get('wheel_multiplier', 5.0)
+MINES_MULTIPLIER = settings.get('mines_multiplier', 1.5)
+
+# Коэффициенты для игры Мины
+MINES_MULTIPLIERS = {
+    3: [1.114, 1.273, 1.464, 1.695, 1.977, 2.326, 2.762, 3.315, 4.025, 4.954, 6.192, 7.881, 10.245, 13.661, 18.783, 26.833, 40.250, 64.400, 112.700, 225.400, 563.500, 2254.000],
+    4: [1.16, 1.38, 1.64, 1.95, 2.32, 2.76, 3.29, 3.92, 4.67, 5.57, 6.64, 7.92, 9.45, 11.27, 13.45, 16.05, 19.15, 22.85, 27.25, 32.50, 38.75],
+    5: [1.225, 1.547, 1.977, 2.559, 3.358, 4.478, 6.077, 8.414, 11.920, 17.338, 26.008, 40.456, 65.742, 112.700, 206.617, 413.233, 929.775, 2479.400, 8677.900, 52067.400]
+}
 
 # Состояния для FSM
 class DepositStates(StatesGroup):
@@ -685,12 +941,25 @@ class AdminStates(StatesGroup):
     waiting_for_slots_chance = State()
     waiting_for_wheel_chance = State()
     waiting_for_lottery_chance = State()
+    waiting_for_mines_chance = State()
     waiting_for_duel_multiplier = State()
     waiting_for_dice_multiplier = State()
     waiting_for_basketball_multiplier = State()
     waiting_for_slots_multiplier = State()
     waiting_for_wheel_multiplier = State()
     waiting_for_lottery_multiplier = State()
+    waiting_for_mines_multiplier = State()
+    waiting_for_fake_games_interval = State()
+    waiting_for_fake_bets_interval = State()
+    waiting_for_fake_games_status = State()
+    waiting_for_fake_bets_min = State()
+    waiting_for_fake_bets_max = State()
+    waiting_for_payout_channel_url = State()
+    waiting_for_games_channel_url = State()
+    waiting_for_news_channel_url = State()
+    waiting_for_referral_url = State()
+    waiting_for_username_stats = State()
+    waiting_for_edit_balance = State()
 
 class WithdrawStates(StatesGroup):
     waiting_for_wallet_address = State()
@@ -714,6 +983,15 @@ class LotteryStates(StatesGroup):
 class WheelStates(StatesGroup):
     waiting_for_bet = State()
 
+class MinesStates(StatesGroup):
+    waiting_for_bet = State()
+    waiting_for_bomb_count = State()
+    playing_game = State()
+    waiting_for_cell_selection = State()
+
+class BroadcastStates(StatesGroup):
+    waiting_for_message = State()
+
 
 
 
@@ -736,45 +1014,53 @@ async def get_main_menu(user_id=None):
             print(f"Ошибка проверки ежедневного бонуса: {e}")
             show_daily_bonus = True  # Показываем по умолчанию при ошибке
 
+    # Получаем актуальные ссылки из базы данных
+    payout_channel_url = await async_get_setting('payout_channel_url', 'https://t.me/+TjSS6Sl3WDEzNzUy')
+    games_channel_url = await async_get_setting('games_channel_url', 'https://t.me/+wxU6EuBO8ZA4NGFi')
+    news_channel_url = await async_get_setting('news_channel_url', 'https://t.me/VanishCasino')
+    referral_url = await async_get_setting('referral_url', 'https://t.me/VanishCasinoBot')
+
     # Формируем клавиатуру
     inline_keyboard = [
         [
-            InlineKeyboardButton(text="🎮 ИГРАТЬ СЕЙЧАС", callback_data="play"),
-            InlineKeyboardButton(text="👥 РЕФЕРАЛЫ 💰", callback_data="referral")
+            InlineKeyboardButton(text="🎰 Играть", callback_data="play"),
+            InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")
         ],
         [
-            InlineKeyboardButton(text="👤 МОЙ ПРОФИЛЬ", callback_data="profile"),
-            InlineKeyboardButton(text="📊 ТОП ИГРОКОВ", callback_data="rating")
+            InlineKeyboardButton(text="💳 Пополнить", callback_data="deposit"),
+            InlineKeyboardButton(text="💵 Вывести", callback_data="withdraw")
         ],
         [
-            InlineKeyboardButton(text="💰 ПОПОЛНИТЬ 💳", callback_data="deposit"),
-            InlineKeyboardButton(text="💸 ВЫВЕСТИ 💎", callback_data="withdraw")
+            InlineKeyboardButton(text="🏆 Рейтинг", callback_data="rating"),
+            InlineKeyboardButton(text="🎁 Ежедневный бонус", callback_data="daily_bonus")
         ]
     ]
 
-    # Добавляем строку с ежедневным бонусом только если нужно показать
-    if show_daily_bonus:
-        inline_keyboard.append([
-            InlineKeyboardButton(text="🎁 ЕЖЕДНЕВНЫЙ БОНУС", callback_data="daily_bonus"),
-            InlineKeyboardButton(text="👥 НАШИ ГРУППЫ", callback_data="groups")
-        ])
-    else:
-        inline_keyboard.append([
-            InlineKeyboardButton(text="👥 НАШИ ГРУППЫ", callback_data="groups")
-        ])
+    # Добавляем дополнительные кнопки
+    inline_keyboard.append([
+        InlineKeyboardButton(text="👥 Рефералы", callback_data="referral"),
+        InlineKeyboardButton(text="🎫 Промокоды", callback_data="promo_codes")
+    ])
 
-    inline_keyboard.append([InlineKeyboardButton(text="🎫 ПРОМОКОДЫ 🎉", callback_data="promo_codes")])
-    inline_keyboard.append([InlineKeyboardButton(text="🛠️ ПОДДЕРЖКА", callback_data="support")])
+    # Добавляем строку с группами и поддержкой
+    inline_keyboard.append([
+        InlineKeyboardButton(text="👥 Наши группы", callback_data="groups"),
+        InlineKeyboardButton(text="🛠️ Поддержка", callback_data="support")
+    ])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     return keyboard
 
 def get_admin_panel():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Все шансы игр", callback_data="admin_all_chances")],
-        [InlineKeyboardButton(text="⚡ Множители", callback_data="admin_multiplier")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="💰 Установить баланс", callback_data="admin_set_balance")],
+        [InlineKeyboardButton(text="📊 Статистика проекта", callback_data="stats_project")],
+        [InlineKeyboardButton(text="💰 Управление балансом", callback_data="admin_balance")],
+        [InlineKeyboardButton(text="📋 Логи пользователей", callback_data="admin_user_logs")],
+        [InlineKeyboardButton(text="🎭 Фейковые ставки", callback_data="settings_fake")],
+        [InlineKeyboardButton(text="📈 Коэффициенты", callback_data="admin_all_chances")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="all_message_send")],
+        [InlineKeyboardButton(text="🔗 Изменить URL", callback_data="edit_urls")],
+        [InlineKeyboardButton(text="🗑️ Удалить чеки", callback_data="deleted_checks")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
     return keyboard
@@ -792,6 +1078,17 @@ def get_back_button():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
     return keyboard
 
+# Меню коэффициентов
+def get_chances_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Кости", callback_data="edit_chance_duel")],
+        [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_chance_basketball")],
+        [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_chance_slots")],
+        [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_chance_dice")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+    return keyboard
+
 # Меню игр
 def get_games_menu():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -802,10 +1099,10 @@ def get_games_menu():
         ],
         [
             InlineKeyboardButton(text="🎰 Слоты", callback_data="game_slots"),
-            InlineKeyboardButton(text="🎲 Лотерея", callback_data="game_lottery"),
-            InlineKeyboardButton(text="🎡 Колесо", callback_data="game_wheel")
+            InlineKeyboardButton(text="🎲 Лотерея", callback_data="game_lottery")
         ],
         [
+            InlineKeyboardButton(text="🎡 Колесо", callback_data="game_wheel"),
             InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
         ]
     ])
@@ -816,10 +1113,20 @@ def get_deposit_back_button():
     return keyboard
 
 # Меню групп
-def get_groups_menu():
+async def get_groups_menu():
+    # Получаем актуальные ссылки из базы данных
+    payout_channel_url = await async_get_setting('payout_channel_url', 'https://t.me/+TjSS6Sl3WDEzNzUy')
+    games_channel_url = await async_get_setting('games_channel_url', 'https://t.me/+wxU6EuBO8ZA4NGFi')
+    news_channel_url = await async_get_setting('news_channel_url', 'https://t.me/VanishCasino')
+    referral_url = await async_get_setting('referral_url', 'https://t.me/VanishCasinoBot')
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 {group['name']}", url=group['url'])] for group in GROUPS
-    ] + [[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]])
+        [InlineKeyboardButton(text="💰 Канал с выплатами", url=payout_channel_url)],
+        [InlineKeyboardButton(text="🎮 Канал с играми", url=games_channel_url)],
+        [InlineKeyboardButton(text="📰 Новостной канал", url=news_channel_url)],
+        [InlineKeyboardButton(text="👥 Реферальная программа [20%]", url=referral_url)],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+    ])
     return keyboard
 
 # Меню промокодов
@@ -854,22 +1161,19 @@ async def get_welcome_text(user):
     # Получаем задание дня
     task = get_daily_task()
 
-    welcome_text = f"""🎰 <b>VanishCasino</b> 🎰<blockquote> Самое лучшее казино в Telegram!</blockquote>
+    welcome_text = f"""🎰 <b>{CASINO_NAME}</b> 🎰
+<blockquote>🚀 Лучшее казино в Telegram!</blockquote>
 
- {greeting}!
+{greeting}!
 
- 🎁 <b>Задание дня:</b> {task['description']}
- 💰 Награда: {task['reward']}$ ✨
+🎁 <b>Задание дня:</b> {task['description']}
+💰 Награда: <code>{task['reward']}$</code> ✨
 
- <blockquote> <b>🌟 Работы без выходных!</b> </blockquote>
- <blockquote> <b>⏰ Круглосуточно!</b> </blockquote>
- <blockquote> <b>💎 Мгновенные выплаты!</b> </blockquote>
- <blockquote> <b>🔥 Выигрыши до x8!</b> </blockquote>
+💎 <b>Баланс:</b> <code>{balance}$</code> | 👥 <b>Реферальный:</b> <code>{referral_balance}$</code>
 
- 💰 <b>Баланс:</b> <code>{balance}$</code>
- ⚡ <b>Реферальный:</b> <code>{referral_balance}$</code>
+🌟 <i>Работаем 24/7 • Мгновенные выплаты • Выигрыши до x8!</i>
 
- 🚀 <i>Выберите действие ниже!</i>"""
+🚀 <i>Выберите действие в меню ниже!</i>"""
 
     return welcome_text, "HTML"
 
@@ -1011,7 +1315,7 @@ async def start_command(message: types.Message):
             print(f"❌ Ошибка отправки сообщения без фото: {e2}")
             # Последняя попытка - отправить простое сообщение
             try:
-                await message.answer("🎰 Добро пожаловать в Test Casino!\n\nИспользуйте кнопки ниже для навигации.", reply_markup=main_menu)
+                await message.answer("🎰 Добро пожаловать в Vanish Casino!\n\nИспользуйте кнопки ниже для навигации.", reply_markup=main_menu)
                 print(f"📤 Простое приветственное сообщение отправлено пользователю {user.id}")
             except Exception as e3:
                 print(f"❌ Критическая ошибка: не удалось отправить ни одно сообщение пользователю {user.id}: {e3}")
@@ -1247,6 +1551,68 @@ async def chat_command(message: types.Message):
 
     except Exception as e:
         await message.reply(f"❌ Ошибка при отправке сообщения: {e}")
+
+# Обработчик /del для админов - удаление конкретного чека
+async def delete_check_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("❌ У вас нет прав администратора")
+        return
+
+    # Rate limiting
+    if not await check_command_rate_limit(message.from_user.id, 'del'):
+        await message.reply("⏳ Подождите перед повторным использованием команды")
+        return
+
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Использование: /del <ID_чека>\nПример: /del 123")
+        return
+
+    try:
+        check_id = int(args[1])
+    except ValueError:
+        await message.reply("❌ Неверный ID чека")
+        return
+
+    # Проверяем, существует ли чек
+    payments = await async_get_all_payments(1000)  # Получаем много платежей для поиска
+    payment_exists = any(p[0] == check_id for p in payments)  # p[0] - это payment_id
+
+    if not payment_exists:
+        await message.reply(f"❌ Чек с ID {check_id} не найден")
+        return
+
+    # Получаем информацию о чеке перед удалением
+    payment_info = None
+    for p in payments:
+        if p[0] == check_id:
+            payment_info = p
+            break
+
+    if payment_info:
+        payment_id, user_id, amount, invoice_id, status, created_at, username, telegram_id = payment_info
+        username_display = username or f"ID:{telegram_id}" if telegram_id else f"User{user_id}"
+
+        # Удаляем чек
+        await async_delete_payment(check_id)
+
+        success_text = f"""✅ <b>Чек успешно удален!</b>
+
+🆔 <b>ID чека:</b> <code>{check_id}</code>
+💰 <b>Сумма:</b> <code>{amount}$</code>
+👤 <b>Пользователь:</b> @{username_display}
+🆔 <b>Invoice:</b> <code>{invoice_id}</code>
+📊 <b>Статус:</b> {status}
+📅 <b>Создан:</b> {created_at}
+
+<i>Чек удален из базы данных.</i>"""
+
+        await message.reply(success_text, parse_mode="HTML")
+
+        # Логируем удаление чека
+        await async_log_action(message.from_user.id, "admin_delete_check", 0, f"Удален чек ID {check_id} на сумму {amount}$ пользователя @{username_display}")
+    else:
+        await message.reply(f"❌ Не удалось получить информацию о чеке {check_id}")
 
 # Обработчик /fake для админов - фейковый вывод средств
 async def fake_withdraw_command(message: types.Message):
@@ -2437,6 +2803,7 @@ async def admin_chances_handler(callback_query: types.CallbackQuery):
         [InlineKeyboardButton(text="🏀 Баскетбол", callback_data="edit_chance_basketball")],
         [InlineKeyboardButton(text="🎰 Слоты", callback_data="edit_chance_slots")],
         [InlineKeyboardButton(text="🎳 Кубики", callback_data="edit_chance_dice")],
+        [InlineKeyboardButton(text="💣 Мины", callback_data="edit_chance_mines")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
     ])
 
@@ -2454,10 +2821,16 @@ async def edit_chance_duel_handler(callback_query: types.CallbackQuery, state: F
         return
 
     await state.set_state(AdminStates.waiting_for_duel_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Дуэли (текущий: {DUEL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 # Обработчик редактирования шанса Кубикиа
@@ -2467,10 +2840,16 @@ async def edit_chance_dice_handler(callback_query: types.CallbackQuery, state: F
         return
 
     await state.set_state(AdminStates.waiting_for_dice_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🎳 Введите новый шанс выигрыша для Кубикиа (текущий: {DICE_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 # Обработчик редактирования шанса баскетбола
@@ -2480,10 +2859,16 @@ async def edit_chance_basketball_handler(callback_query: types.CallbackQuery, st
         return
 
     await state.set_state(AdminStates.waiting_for_basketball_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🏀 Введите новый шанс выигрыша для Баскетбола (текущий: {BASKETBALL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 # Обработчик редактирования шанса слотов
@@ -2493,10 +2878,16 @@ async def edit_chance_slots_handler(callback_query: types.CallbackQuery, state: 
         return
 
     await state.set_state(AdminStates.waiting_for_slots_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🎰 Введите новый шанс выигрыша для Слотов (текущий: {SLOTS_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 # Обработчик редактирования шанса колеса фортуны
@@ -2506,10 +2897,16 @@ async def edit_chance_wheel_handler(callback_query: types.CallbackQuery, state: 
         return
 
     await state.set_state(AdminStates.waiting_for_wheel_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🎡 Введите новый шанс выигрыша для Колеса фортуны (текущий: {WHEEL_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 # Обработчик редактирования шанса лотереи
@@ -2519,10 +2916,35 @@ async def edit_chance_lottery_handler(callback_query: types.CallbackQuery, state
         return
 
     await state.set_state(AdminStates.waiting_for_lottery_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
     try:
-        await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.edit_text(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     except:
-        await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=get_back_button())
+        await callback_query.message.answer(f"🎲 Введите новый шанс выигрыша для Лотереи (текущий: {LOTTERY_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
+    await callback_query.answer()
+
+# Обработчик редактирования шанса мин
+async def edit_chance_mines_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_mines_chance)
+
+    # Создаем кнопку назад в меню коэффициентов
+    back_to_chances_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к коэффициентам", callback_data="admin_chances")]
+    ])
+
+    try:
+        await callback_query.message.edit_text(f"💣 Введите новый шанс выигрыша для Мин (текущий: {MINES_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
+    except:
+        await callback_query.message.answer(f"💣 Введите новый шанс выигрыша для Мин (текущий: {MINES_WIN_CHANCE}%):", reply_markup=back_to_chances_button)
     await callback_query.answer()
 
 
@@ -2547,7 +2969,7 @@ async def set_duel_chance_handler(message: types.Message, state: FSMContext):
         DUEL_WIN_CHANCE = new_chance
         await async_save_game_setting('duel_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Дуэли изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Дуэли изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2576,7 +2998,7 @@ async def set_dice_chance_handler(message: types.Message, state: FSMContext):
         DICE_WIN_CHANCE = new_chance
         await async_save_game_setting('dice_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Кубикие изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Кубикие изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2605,7 +3027,7 @@ async def set_basketball_chance_handler(message: types.Message, state: FSMContex
         BASKETBALL_WIN_CHANCE = new_chance
         await async_save_game_setting('basketball_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Баскетболе изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Баскетболе изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2634,7 +3056,7 @@ async def set_slots_chance_handler(message: types.Message, state: FSMContext):
         SLOTS_WIN_CHANCE = new_chance
         await async_save_game_setting('slots_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Слотах изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Слотах изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2663,7 +3085,7 @@ async def set_wheel_chance_handler(message: types.Message, state: FSMContext):
         WHEEL_WIN_CHANCE = new_chance
         await async_save_game_setting('wheel_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Колесе фортуны изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Колесе фортуны изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2685,14 +3107,14 @@ async def set_lottery_chance_handler(message: types.Message, state: FSMContext):
     try:
         new_chance = float(message.text.strip())
         if not 0 <= new_chance <= 100:
-            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_back_button())
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_chances_menu())
             return
 
         global LOTTERY_WIN_CHANCE
         LOTTERY_WIN_CHANCE = new_chance
         await async_save_game_setting('lottery_win_chance', new_chance)
         try:
-            await message.answer(f"✅ Шанс выигрыша в Лотерее изменен на {new_chance}%", reply_markup=get_admin_panel())
+            await message.answer(f"✅ Шанс выигрыша в Лотерее изменен на {new_chance}%", reply_markup=get_chances_menu())
         except:
             pass
         await state.clear()
@@ -2700,6 +3122,228 @@ async def set_lottery_chance_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
 
+# Обработчик ввода нового шанса мин
+async def set_mines_chance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_chance = float(message.text.strip())
+        if not 0 <= new_chance <= 100:
+            await message.answer("❌ Шанс должен быть от 0 до 100", reply_markup=get_chances_menu())
+            return
+
+        global MINES_WIN_CHANCE
+        MINES_WIN_CHANCE = new_chance
+        await async_save_game_setting('mines_win_chance', new_chance)
+        try:
+            await message.answer(f"✅ Шанс выигрыша в Минах изменен на {new_chance}%", reply_markup=get_chances_menu())
+        except:
+            pass
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+
+
+# Обработчик кнопки "🎭 Фейковые ставки"
+async def settings_fake_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    fake_status_text = f"""🎭 <b>НАСТРОЙКИ ФЕЙКОВЫХ СТАВОК</b>
+
+📊 <b>Текущие настройки:</b>
+• 🔄 Автоматическая отправка: {'✅ ВКЛ' if fake_games_enabled else '❌ ВЫКЛ'}
+• ⏱️ Интервал игр: {fake_games_interval} сек
+• 💰 Мин. ставка: {fake_bets_min}$
+• 💰 Макс. ставка: {fake_bets_max}$
+
+🎮 <b>Доступные действия:</b>
+• 🔄 Изменить интервал игр
+• 💰 Изменить диапазон ставок
+• ▶️ Включить/выключить фейковые ставки
+• 📊 Посмотреть статистику"""
+
+    fake_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Интервал игр", callback_data="fake_games_interval")],
+        [InlineKeyboardButton(text="💰 Диапазон ставок", callback_data="fake_bets_range")],
+        [InlineKeyboardButton(text="▶️ Включить/Выключить", callback_data="fake_toggle")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="fake_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    try:
+        # Пробуем отредактировать caption сообщения
+        await callback_query.message.edit_caption(
+            caption=fake_status_text,
+            reply_markup=fake_keyboard,
+            parse_mode="HTML"
+        )
+        print("Caption успешно отредактирован в settings_fake_handler")
+    except Exception as e:
+        print(f"Ошибка редактирования caption в settings_fake_handler: {e}")
+        try:
+            # Пробуем отредактировать медиа
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=fake_status_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=fake_keyboard)
+            print("Медиа успешно отредактировано в settings_fake_handler")
+        except Exception as e2:
+            print(f"Ошибка редактирования медиа в settings_fake_handler: {e2}")
+            # Если редактирование не удалось, отправляем новое сообщение
+            try:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=fake_status_text, reply_markup=fake_keyboard, parse_mode="HTML")
+                print("Новое сообщение отправлено в settings_fake_handler")
+            except Exception as e3:
+                print(f"Ошибка отправки нового сообщения: {e3}")
+                await callback_query.message.answer(fake_status_text, reply_markup=fake_keyboard, parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик изменения интервала фейковых игр
+async def fake_games_interval_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_fake_games_interval)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    interval_text = f"""⏱️ <b>НАСТРОЙКА ИНТЕРВАЛА ФЕЙКОВЫХ ИГР</b>
+
+Текущий интервал: {fake_games_interval} секунд
+
+💡 <b>Рекомендуемые значения:</b>
+• 5-10 сек - частые игры (для теста)
+• 30-60 сек - средняя частота
+• 300 сек (5 мин) - редкие игры
+
+Введите новый интервал в секундах:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=interval_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=interval_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик изменения диапазона ставок
+async def fake_bets_range_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    range_text = f"""💰 <b>НАСТРОЙКА ДИАПАЗОНА СТАВОК</b>
+
+📊 <b>Текущие настройки:</b>
+• Минимальная ставка: {fake_bets_min}$
+• Максимальная ставка: {fake_bets_max}$
+
+Выберите, что хотите изменить:"""
+
+    range_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Мин. ставка", callback_data="fake_bets_min")],
+        [InlineKeyboardButton(text="💎 Макс. ставка", callback_data="fake_bets_max")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_fake")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=range_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=range_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=range_text, reply_markup=range_keyboard, parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик включения/выключения фейковых ставок
+async def fake_toggle_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    global fake_games_enabled
+
+    old_status = fake_games_enabled
+
+    if fake_games_enabled:
+        # Выключаем фейковые ставки
+        await stop_fake_games()
+        status_text = "❌ Фейковые ставки ВЫКЛЮЧЕНЫ"
+        button_text = "▶️ Включить"
+        await callback_query.answer("Фейковые ставки выключены", show_alert=True)
+    else:
+        # Включаем фейковые ставки
+        await start_fake_games()
+        status_text = "✅ Фейковые ставки ВКЛЮЧЕНЫ"
+        button_text = "⏹️ Выключить"
+        await callback_query.answer("Фейковые ставки включены", show_alert=True)
+
+    # Проверяем, изменился ли статус
+    if old_status == fake_games_enabled:
+        # Статус не изменился, просто показываем уведомление
+        return
+
+    toggle_text = f"""🎭 <b>СТАТУС ФЕЙКОВЫХ СТАВОК</b>
+
+{status_text}
+
+📊 <b>Текущие настройки:</b>
+• ⏱️ Интервал: {fake_games_interval} сек
+• 💰 Мин. ставка: {fake_bets_min}$
+• 💰 Макс. ставка: {fake_bets_max}$"""
+
+    toggle_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=button_text, callback_data="fake_toggle")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="settings_fake")]
+    ])
+
+    try:
+        # Пробуем отредактировать caption сообщения с фото
+        await callback_query.message.edit_caption(
+            caption=toggle_text,
+            reply_markup=toggle_keyboard,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Ошибка редактирования caption: {e}")
+        # Если редактирование не удалось, отправляем новое сообщение
+        try:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=toggle_text, reply_markup=toggle_keyboard, parse_mode="HTML")
+        except:
+            await callback_query.message.answer(toggle_text, reply_markup=toggle_keyboard, parse_mode="HTML")
+
+# Обработчик статистики фейковых ставок
+async def fake_stats_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Здесь можно добавить статистику отправленных фейковых игр
+    stats_text = f"""📊 <b>СТАТИСТИКА ФЕЙКОВЫХ СТАВОК</b>
+
+📈 <b>Статус:</b> {'🟢 Активны' if fake_games_enabled else '🔴 Неактивны'}
+⏱️ <b>Интервал:</b> {fake_games_interval} сек
+💰 <b>Диапазон ставок:</b> {fake_bets_min}$ - {fake_bets_max}$
+
+💡 <b>Рекомендации:</b>
+• Используйте фейковые ставки для демонстрации активности
+• Настройте реалистичные суммы ставок
+• Не устанавливайте слишком частый интервал для избежания спама"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
 
 # Обработчик админ панели множителей
 async def admin_multiplier_handler(callback_query: types.CallbackQuery):
@@ -2807,6 +3451,1364 @@ async def admin_stats_handler(callback_query: types.CallbackQuery):
     except:
         await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
     await callback_query.answer()
+
+# Обработчик кнопки "🗑️ Удалить чеки"
+async def delete_checks_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем все платежи
+    payments = await async_get_all_payments(20)  # Последние 20 платежей
+
+    if not payments:
+        delete_text = """🗑️ <b>УДАЛЕНИЕ ЧЕКОВ</b>
+
+❌ Чеков не найдено
+
+<i>В базе данных нет платежей для удаления.</i>"""
+
+        delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=delete_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=delete_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=delete_text, reply_markup=delete_keyboard, parse_mode="HTML")
+
+        await callback_query.answer()
+        return
+
+    # Подсчитываем статистику
+    total_payments = len(payments)
+    paid_payments = sum(1 for p in payments if p[4] == 'paid')  # status на позиции 4
+    pending_payments = sum(1 for p in payments if p[4] == 'pending')
+    total_amount = sum(float(p[2]) for p in payments if p[2] is not None)  # amount на позиции 2
+
+    delete_text = f"""🗑️ <b>УДАЛЕНИЕ ЧЕКОВ</b>
+
+📊 <b>Найдено чеков:</b> {total_payments}
+💰 <b>Общая сумма:</b> {total_amount:.2f}$
+✅ <b>Оплаченных:</b> {paid_payments}
+⏳ <b>Ожидающих:</b> {pending_payments}
+
+⚠️ <b>Внимание!</b>
+<i>Удаление чеков приведет к полной очистке истории платежей.
+Это действие нельзя отменить!</i>
+
+Выберите действие:"""
+
+    delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Удалить ВСЕ чеки", callback_data="delete_all_checks_confirm")],
+        [InlineKeyboardButton(text="📋 Показать чеки", callback_data="show_checks_list")],
+        [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=delete_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=delete_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=delete_text, reply_markup=delete_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик подтверждения удаления всех чеков
+async def delete_all_checks_confirm_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Проверяем подтверждение через callback_data
+    if "confirm" not in callback_query.data:
+        # Показываем подтверждение
+        confirm_text = """⚠️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>
+
+Вы действительно хотите удалить ВСЕ чеки?
+
+Это действие:
+• ❌ Удалит все платежи
+• ❌ Очистит историю транзакций
+• ❌ Удалит pending платежи
+• ❌ Удалит оплаченные чеки
+
+<i>Это действие НЕЛЬЗЯ ОТМЕНИТЬ!</i>"""
+
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ УДАЛЕНИЕ", callback_data="delete_all_checks_confirm_yes")],
+            [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="delete_checks")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=confirm_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=confirm_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=confirm_text, reply_markup=confirm_keyboard, parse_mode="HTML")
+
+        await callback_query.answer()
+        return
+
+    # Выполняем удаление
+    try:
+        # Получаем количество чеков перед удалением
+        payments_before = await async_get_all_payments(1)
+        count_before = len(payments_before) if payments_before else 0
+
+        # Удаляем все чеки
+        await async_delete_all_payments()
+
+        # Проверяем результат
+        payments_after = await async_get_all_payments(1)
+        count_after = len(payments_after) if payments_after else 0
+
+        if count_after == 0:
+            success_text = f"""✅ <b>ЧЕКИ УСПЕШНО УДАЛЕНЫ!</b>
+
+🗑️ <b>Удалено чеков:</b> {count_before}
+💾 <b>База данных очищена</b>
+
+<i>Все платежи и чеки были удалены из системы.</i>"""
+
+            success_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+            ])
+
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=success_text, parse_mode="HTML")
+                await callback_query.message.edit_media(media=media, reply_markup=success_keyboard)
+            except:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=success_text, reply_markup=success_keyboard, parse_mode="HTML")
+
+            # Логируем удаление чеков
+            await async_log_action(callback_query.from_user.id, "admin_delete_all_checks", 0, f"Удалено {count_before} чеков")
+
+            await callback_query.answer("✅ Все чеки удалены!", show_alert=True)
+        else:
+            error_text = """❌ <b>Ошибка удаления</b>
+
+Не удалось удалить все чеки.
+Попробуйте еще раз или обратитесь к разработчику."""
+
+            error_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="delete_checks")],
+                [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+            ])
+
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await callback_query.message.edit_media(media=media, reply_markup=error_keyboard)
+            except:
+                await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=error_keyboard, parse_mode="HTML")
+
+            await callback_query.answer("❌ Ошибка удаления", show_alert=True)
+
+    except Exception as e:
+        error_text = f"""❌ <b>Критическая ошибка</b>
+
+Произошла ошибка при удалении чеков:
+{e}
+
+Обратитесь к разработчику."""
+
+        error_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=error_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=error_text, reply_markup=error_keyboard, parse_mode="HTML")
+
+        await callback_query.answer("❌ Критическая ошибка", show_alert=True)
+
+# Обработчик показа списка чеков
+async def show_checks_list_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем платежи для отображения
+    payments = await async_get_all_payments(10)  # Первые 10 платежей
+
+    if not payments:
+        await callback_query.answer("❌ Чеков не найдено", show_alert=True)
+        return
+
+    checks_text = """📋 <b>СПИСОК ЧЕКОВ</b>
+
+"""
+
+    for i, payment in enumerate(payments, 1):
+        payment_id, user_id, amount, invoice_id, status, created_at, username, telegram_id = payment
+
+        # Определяем статус для отображения
+        status_emoji = {
+            'paid': '✅',
+            'pending': '⏳',
+            'failed': '❌',
+            'cancelled': '🚫'
+        }.get(status, '❓')
+
+        username_display = username or f"ID:{telegram_id}" if telegram_id else f"User{user_id}"
+
+        checks_text += f"{i}. {status_emoji} <code>{amount}$</code> - @{username_display}\n"
+        checks_text += f"   🆔 {invoice_id}\n"
+        checks_text += f"   📅 {created_at}\n"
+        checks_text += f"   🔗 Удалить: /del_{payment_id}\n\n"
+
+    checks_text += """<i>Используйте команды /del_ID для удаления конкретного чека</i>"""
+
+    # Разбиваем текст на части если он слишком длинный
+    if len(checks_text) > 4000:
+        # Отправляем несколько сообщений
+        parts = [checks_text[i:i+4000] for i in range(0, len(checks_text), 4000)]
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=parts[0], parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=parts[0], reply_markup=get_back_button(), parse_mode="HTML")
+
+        # Отправляем оставшиеся части как обычные сообщения
+        for part in parts[1:]:
+            try:
+                await callback_query.message.answer(part, parse_mode="HTML")
+            except:
+                await callback_query.message.answer(part)
+    else:
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=checks_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=checks_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик кнопки "🔗 Изменить URL"
+async def edit_urls_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    try:
+        # Получаем текущие URL из базы данных или config по умолчанию
+        payout_channel_url = await async_get_setting('payout_channel_url', 'https://t.me/+TjSS6Sl3WDEzNzUy')
+        games_channel_url = await async_get_setting('games_channel_url', 'https://t.me/+wxU6EuBO8ZA4NGFi')
+        news_channel_url = await async_get_setting('news_channel_url', 'https://t.me/VanishCasino')
+        referral_url = await async_get_setting('referral_url', 'https://t.me/VanishCasinoBot')
+
+        urls_text = f"""🔗 <b>УПРАВЛЕНИЕ URL ССЫЛКАМИ</b>
+
+📋 <b>Текущие ссылки:</b>
+
+🔗 <b>Канал с выплатами:</b>
+{payout_channel_url}
+
+🔗 <b>Канал с играми:</b>
+{games_channel_url}
+
+🔗 <b>Новостной канал:</b>
+{news_channel_url}
+
+🔗 <b>Реферальная программа:</b>
+{referral_url}
+
+Выберите ссылку для редактирования:"""
+
+        urls_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Канал с выплатами", callback_data="edit_payout_channel")],
+            [InlineKeyboardButton(text="🎮 Канал с играми", callback_data="edit_games_channel")],
+            [InlineKeyboardButton(text="📰 Новостной канал", callback_data="edit_news_channel")],
+            [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="edit_referral_url")],
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=urls_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=urls_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=urls_text, reply_markup=urls_keyboard, parse_mode="HTML")
+
+        await callback_query.answer()
+
+    except Exception as e:
+        error_text = f"❌ Ошибка получения URL ссылок: {e}"
+        await callback_query.answer(error_text, show_alert=True)
+
+# Обработчик кнопки "👤 Статистика пользователя"
+async def stats_user_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_username_stats)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    stats_text = """👤 <b>СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ</b>
+
+📝 <b>Введите @username пользователя:</b>
+
+<i>Пример: @likkero</i>
+
+💡 <b>Будет показана подробная информация о пользователе</b>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик ввода username для статистики
+async def username_stats_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    username = message.text.strip()
+    if username.startswith('@'):
+        username = username[1:]  # Убираем @
+
+    if not username:
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите username пользователя.
+
+<i>Пример: @likkero</i>"""
+
+        # Создаем клавиатуру для повторного ввода username
+        retry_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="stats_user")],
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    media=media,
+                    reply_markup=retry_keyboard
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Fallback - отправляем новое сообщение
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            # Fallback - отправляем новое сообщение
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        # НЕ очищаем состояние, чтобы админ мог попробовать еще раз
+        # await state.clear()
+        return
+
+    # Получаем пользователя по username
+    user_data = await async_get_user_by_username(username)
+
+    if not user_data:
+        error_text = f"""❌ <b>Пользователь не найден</b>
+
+Пользователь @{username} не найден в базе данных.
+
+<i>Проверьте правильность написания username.</i>"""
+
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        # Создаем клавиатуру для повторного ввода username
+        retry_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="stats_user")],
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    media=media,
+                    reply_markup=retry_keyboard
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Fallback - отправляем новое сообщение
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            # Fallback - отправляем новое сообщение
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+        # НЕ очищаем состояние, чтобы админ мог попробовать еще раз
+        # await state.clear()
+        return
+
+    # Получаем детальную статистику пользователя
+    telegram_id = user_data[1]
+    stats = await get_cached_user_stats(telegram_id)
+
+    if not stats:
+        error_text = f"""❌ <b>Ошибка получения статистики</b>
+
+Не удалось получить статистику для пользователя @{username}."""
+
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        # Создаем клавиатуру для повторного ввода username
+        retry_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="stats_user")],
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    media=media,
+                    reply_markup=retry_keyboard
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                # Fallback - отправляем новое сообщение
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                # Fallback - отправляем новое сообщение
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        
+                # НЕ очищаем состояние, чтобы админ мог попробовать еще раз
+                # await state.clear()
+                return
+
+    # Получаем дополнительные данные
+    user_data = await async_get_user(telegram_id)
+    active_referrals_count = user_data[12] if user_data and len(user_data) > 12 else 0
+
+    # Вычисляем дополнительные метрики
+    net_profit = stats['total_deposited'] - stats['total_spent']
+    avg_bet = stats['total_spent'] / max(1, stats['games_played'])
+    profit_per_game = net_profit / max(1, stats['games_played'])
+    roi = (net_profit / max(1, stats['total_deposited'])) * 100 if stats['total_deposited'] > 0 else 0
+
+    # Определяем уровень игрока
+    if stats['total_deposited'] >= 1000:
+        player_level = "🏆 VIP Игрок"
+    elif stats['total_deposited'] >= 500:
+        player_level = "💎 Опытный"
+    elif stats['total_deposited'] >= 100:
+        player_level = "🥇 Активный"
+    elif stats['games_played'] >= 50:
+        player_level = "🥈 Постоянный"
+    else:
+        player_level = "🥉 Начинающий"
+
+    # Определяем эффективность
+    if roi >= 50:
+        efficiency = "🚀 Отличная"
+    elif roi >= 20:
+        efficiency = "📈 Хорошая"
+    elif roi >= 0:
+        efficiency = "📊 Средняя"
+    else:
+        efficiency = "📉 Требует улучшения"
+
+    # Получаем последние логи пользователя
+    recent_logs = await async_get_user_logs(telegram_id, limit=5)
+
+    logs_text = ""
+    if recent_logs:
+        logs_text = "\n\n📋 <b>Последние действия:</b>\n"
+        for log in recent_logs:
+            log_telegram_id, action, amount, reason, created_at = log
+            amount_str = f" {amount}$" if amount != 0 else ""
+            logs_text += f"• {action}{amount_str} - {created_at}\n"
+
+    user_stats_text = f"""👤 <b>СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ</b>
+
+👨‍💻 <b>Игрок:</b> @{stats['username']}
+🆔 <b>ID:</b> <code>{telegram_id}</code>
+🏅 <b>Уровень:</b> {player_level}
+📊 <b>Эффективность:</b> {efficiency}
+
+💰 <b>БАЛАНС:</b>
+• Основной: <code>{stats['balance']}$</code>
+• Реферальный: <code>{stats['referral_balance']}$</code>
+• Всего: <code>{stats['balance'] + stats['referral_balance']}$</code>
+
+📈 <b>ИГРОВАЯ АКТИВНОСТЬ:</b>
+• Игр сыграно: <code>{stats['games_played']}</code>
+• Средняя ставка: <code>{avg_bet:.2f}$</code>
+• Прибыль на игру: <code>{profit_per_game:.2f}$</code>
+• Винрейт: <code>{stats['win_rate']:.1f}%</code>
+
+💳 <b>ФИНАНСЫ:</b>
+• Пополнено: <code>{stats['total_deposited']}$</code>
+• Потрачено: <code>{stats['total_spent']}$</code>
+• Чистая прибыль: <code>{net_profit}$</code> {'📈' if net_profit > 0 else '📉'}
+• ROI: <code>{roi:.1f}%</code>
+
+👥 <b>РЕФЕРАЛЫ:</b>
+• Приглашено: <code>{stats['referral_count']}</code>
+• Активных: <code>{active_referrals_count}</code>
+• Заработано: <code>{stats['referral_balance']}$</code>
+
+📅 <b>РЕГИСТРАЦИЯ:</b> {stats['created_at']}{logs_text}
+
+💡 <b>Советы по улучшению:</b>
+{get_improvement_tips(roi, stats['games_played'], avg_bet)}"""
+
+    # Клавиатура с действиями
+    stats_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    # Получаем данные о сообщении для редактирования
+    data = await state.get_data()
+    original_message_id = data.get('original_message_id')
+    original_chat_id = data.get('original_chat_id')
+
+    if original_message_id and original_chat_id:
+        try:
+            # Пробуем отредактировать исходное сообщение
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=user_stats_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=original_chat_id,
+                message_id=original_message_id,
+                media=media,
+                reply_markup=stats_keyboard
+            )
+        except Exception as e:
+            print(f"Ошибка редактирования сообщения: {e}")
+            # Fallback - отправляем новое сообщение
+            try:
+                await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=user_stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+            except:
+                await message.answer(user_stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+    else:
+        # Fallback - отправляем новое сообщение
+        try:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=user_stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+        except:
+            await message.answer(user_stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+
+    await state.clear()
+
+# Обработчик редактирования баланса пользователя
+async def edit_user_balance_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем telegram_id из callback_data
+    telegram_id = int(callback_query.data.split("_")[3])
+
+    await state.set_state(AdminStates.waiting_for_edit_balance)
+    await state.update_data(target_telegram_id=telegram_id)
+
+    # Получаем данные пользователя
+    user_data = await async_get_user(telegram_id)
+    if user_data:
+        username = user_data[2] or f"ID:{telegram_id}"
+        current_balance = round(float(user_data[3]), 2) if user_data[3] is not None else 0
+
+        edit_text = f"""✏️ <b>РЕДАКТИРОВАНИЕ БАЛАНСА</b>
+
+👤 Пользователь: @{username}
+💰 Текущий баланс: {current_balance}$
+
+📝 <b>Выберите действие:</b>
+• Введите новую сумму для установки баланса
+• Или введите +/- сумму для изменения баланса
+
+<i>Пример: 100 (установить 100$) или +50 (добавить 50$) или -25 (вычесть 25$)</i>"""
+
+        edit_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{telegram_id}")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=edit_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=edit_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=edit_text, reply_markup=edit_keyboard, parse_mode="HTML")
+    else:
+        await callback_query.answer("❌ Пользователь не найден", show_alert=True)
+
+    await callback_query.answer()
+
+# Обработчик ввода новой суммы баланса
+async def edit_balance_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        input_text = message.text.strip()
+
+        # Получаем данные состояния
+        data = await state.get_data()
+        target_telegram_id = data.get('target_telegram_id')
+
+        if not target_telegram_id:
+            await message.answer("❌ Ошибка: пользователь не найден", reply_markup=get_back_button())
+            await state.clear()
+            return
+
+        # Парсим ввод пользователя
+        if input_text.startswith('+'):
+            # Добавляем к текущему балансу
+            try:
+                amount_to_add = float(input_text[1:])
+                user_data = await async_get_user(target_telegram_id)
+                current_balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+                new_balance = current_balance + amount_to_add
+                balance_diff = amount_to_add
+                action = "admin_add_balance"
+                action_desc = f"Админ добавил {amount_to_add}$"
+            except ValueError:
+                await message.answer("❌ Неверный формат. Пример: +50", reply_markup=get_back_button())
+                return
+        elif input_text.startswith('-'):
+            # Вычитаем из текущего баланса
+            try:
+                amount_to_subtract = float(input_text[1:])
+                user_data = await async_get_user(target_telegram_id)
+                current_balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+                new_balance = current_balance - amount_to_subtract
+                balance_diff = -amount_to_subtract
+                action = "admin_subtract_balance"
+                action_desc = f"Админ вычел {amount_to_subtract}$"
+            except ValueError:
+                await message.answer("❌ Неверный формат. Пример: -25", reply_markup=get_back_button())
+                return
+        else:
+            # Устанавливаем новый баланс
+            try:
+                new_balance = float(input_text)
+                user_data = await async_get_user(target_telegram_id)
+                current_balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+                balance_diff = new_balance - current_balance
+                action = "admin_set_balance"
+                action_desc = f"Админ установил баланс {new_balance}$"
+            except ValueError:
+                await message.answer("❌ Неверная сумма. Пример: 100 или +50 или -25", reply_markup=get_back_button())
+                return
+
+        # Проверяем, что баланс не отрицательный
+        if new_balance < 0:
+            await message.answer("❌ Баланс не может быть отрицательным", reply_markup=get_back_button())
+            return
+
+        # Обновляем баланс
+        await async_update_balance(target_telegram_id, balance_diff)
+        await invalidate_balance_cache(target_telegram_id)
+
+        # Логируем действие
+        await async_log_action(target_telegram_id, action, abs(balance_diff), action_desc)
+
+        # Получаем обновленные данные пользователя
+        user_data = await async_get_user(target_telegram_id)
+        username = user_data[2] or f"ID:{target_telegram_id}"
+
+        success_text = f"""✅ <b>Баланс успешно обновлен!</b>
+
+👤 Пользователь: @{username}
+💰 Новый баланс: {new_balance}$
+🔄 Изменение: {'+' if balance_diff > 0 else ''}{balance_diff}$
+
+<i>Изменения сохранены в базе данных.</i>"""
+
+        # Клавиатура для возврата
+        back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{target_telegram_id}")]
+        ])
+
+        await message.answer(success_text, reply_markup=back_keyboard, parse_mode="HTML")
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=get_back_button())
+
+    await state.clear()
+
+# Обработчик показа логов пользователя
+async def show_user_logs_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем telegram_id из callback_data
+    telegram_id = int(callback_query.data.split("_")[3])
+
+    # Получаем логи пользователя
+    logs = await async_get_user_logs(telegram_id, limit=20)
+
+    if not logs:
+        logs_text = f"""📋 <b>ЛОГИ ПОЛЬЗОВАТЕЛЯ</b>
+
+👤 Пользователь: ID {telegram_id}
+📝 Логов не найдено"""
+
+        logs_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{telegram_id}")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=logs_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=logs_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=logs_text, reply_markup=logs_keyboard, parse_mode="HTML")
+
+        await callback_query.answer()
+        return
+
+    # Получаем данные пользователя для отображения username
+    user_data = await async_get_user(telegram_id)
+    username = user_data[2] if user_data and user_data[2] else f"ID:{telegram_id}"
+
+    logs_text = f"""📋 <b>ЛОГИ ПОЛЬЗОВАТЕЛЯ</b>
+
+👤 Пользователь: @{username}
+📊 Всего записей: {len(logs)}
+
+"""
+
+    for i, log in enumerate(logs, 1):
+        log_telegram_id, action, amount, reason, created_at = log
+        amount_str = f" {amount}$" if amount != 0 else ""
+        logs_text += f"{i}. {action}{amount_str}\n   💬 {reason}\n   🕒 {created_at}\n\n"
+
+    logs_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{telegram_id}")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=logs_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=logs_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=logs_text, reply_markup=logs_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик проверки платежей пользователя
+async def check_user_payments_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем telegram_id из callback_data
+    telegram_id = int(callback_query.data.split("_")[3])
+
+    # Получаем pending платежи пользователя
+    pending_payments = await async_get_pending_payments(telegram_id)
+
+    # Получаем данные пользователя
+    user_data = await async_get_user(telegram_id)
+    username = user_data[2] if user_data and user_data[2] else f"ID:{telegram_id}"
+
+    if not pending_payments:
+        payments_text = f"""💳 <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ</b>
+
+👤 Пользователь: @{username}
+📊 Активных платежей: 0
+
+<i>Все платежи обработаны или отсутствуют.</i>"""
+
+        payments_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"check_user_payments_{telegram_id}")],
+            [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{telegram_id}")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=payments_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=payments_keyboard)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=payments_text, reply_markup=payments_keyboard, parse_mode="HTML")
+
+        await callback_query.answer()
+        return
+
+    payments_text = f"""💳 <b>ПЛАТЕЖИ ПОЛЬЗОВАТЕЛЯ</b>
+
+👤 Пользователь: @{username}
+📊 Активных платежей: {len(pending_payments)}
+
+"""
+
+    for i, (invoice_id,) in enumerate(pending_payments, 1):
+        # Получаем информацию о платеже
+        payment_data = await async_get_payment_by_invoice(invoice_id)
+        if payment_data:
+            user_id, amount, status, created_at = payment_data[1], payment_data[2], payment_data[3], payment_data[5] if len(payment_data) > 5 else "Неизвестно"
+
+            payments_text += f"{i}. 💰 {amount}$\n"
+            payments_text += f"   🆔 {invoice_id}\n"
+            payments_text += f"   📊 Статус: {status}\n"
+            payments_text += f"   🕒 Создан: {created_at}\n\n"
+
+    payments_text += "<i>Для проверки платежей используйте команду /check_payment в основном боте</i>"
+
+    payments_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"check_user_payments_{telegram_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к статистике", callback_data=f"back_to_user_stats_{telegram_id}")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=payments_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=payments_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=payments_text, reply_markup=payments_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик возврата к статистике пользователя
+async def back_to_user_stats_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем telegram_id из callback_data
+    telegram_id = int(callback_query.data.split("_")[4])
+
+    # Показываем статистику пользователя снова
+    # Получаем данные пользователя
+    user_data = await async_get_user(telegram_id)
+    if not user_data:
+        await callback_query.answer("❌ Пользователь не найден", show_alert=True)
+        return
+
+    stats = await get_cached_user_stats(telegram_id)
+    if not stats:
+        await callback_query.answer("❌ Ошибка получения статистики", show_alert=True)
+        return
+
+    # Используем тот же код что и в username_stats_handler для показа статистики
+    active_referrals_count = user_data[12] if user_data and len(user_data) > 12 else 0
+
+    # Вычисляем дополнительные метрики
+    net_profit = stats['total_deposited'] - stats['total_spent']
+    avg_bet = stats['total_spent'] / max(1, stats['games_played'])
+    profit_per_game = net_profit / max(1, stats['games_played'])
+    roi = (net_profit / max(1, stats['total_deposited'])) * 100 if stats['total_deposited'] > 0 else 0
+
+    # Определяем уровень игрока
+    if stats['total_deposited'] >= 1000:
+        player_level = "🏆 VIP Игрок"
+    elif stats['total_deposited'] >= 500:
+        player_level = "💎 Опытный"
+    elif stats['total_deposited'] >= 100:
+        player_level = "🥇 Активный"
+    elif stats['games_played'] >= 50:
+        player_level = "🥈 Постоянный"
+    else:
+        player_level = "🥉 Начинающий"
+
+    # Определяем эффективность
+    if roi >= 50:
+        efficiency = "🚀 Отличная"
+    elif roi >= 20:
+        efficiency = "📈 Хорошая"
+    elif roi >= 0:
+        efficiency = "📊 Средняя"
+    else:
+        efficiency = "📉 Требует улучшения"
+
+    # Получаем последние логи пользователя
+    recent_logs = await async_get_user_logs(telegram_id, limit=5)
+
+    logs_text = ""
+    if recent_logs:
+        logs_text = "\n\n📋 <b>Последние действия:</b>\n"
+        for log in recent_logs:
+            log_telegram_id, action, amount, reason, created_at = log
+            amount_str = f" {amount}$" if amount != 0 else ""
+            logs_text += f"• {action}{amount_str} - {created_at}\n"
+
+    user_stats_text = f"""👤 <b>СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ</b>
+
+👨‍💻 <b>Игрок:</b> @{stats['username']}
+🆔 <b>ID:</b> <code>{telegram_id}</code>
+🏅 <b>Уровень:</b> {player_level}
+📊 <b>Эффективность:</b> {efficiency}
+
+💰 <b>БАЛАНС:</b>
+• Основной: <code>{stats['balance']}$</code>
+• Реферальный: <code>{stats['referral_balance']}$</code>
+• Всего: <code>{stats['balance'] + stats['referral_balance']}$</code>
+
+📈 <b>ИГРОВАЯ АКТИВНОСТЬ:</b>
+• Игр сыграно: <code>{stats['games_played']}</code>
+• Средняя ставка: <code>{avg_bet:.2f}$</code>
+• Прибыль на игру: <code>{profit_per_game:.2f}$</code>
+• Винрейт: <code>{stats['win_rate']:.1f}%</code>
+
+💳 <b>ФИНАНСЫ:</b>
+• Пополнено: <code>{stats['total_deposited']}$</code>
+• Потрачено: <code>{stats['total_spent']}$</code>
+• Чистая прибыль: <code>{net_profit}$</code> {'📈' if net_profit > 0 else '📉'}
+• ROI: <code>{roi:.1f}%</code>
+
+👥 <b>РЕФЕРАЛЫ:</b>
+• Приглашено: <code>{stats['referral_count']}</code>
+• Активных: <code>{active_referrals_count}</code>
+• Заработано: <code>{stats['referral_balance']}$</code>
+
+📅 <b>РЕГИСТРАЦИЯ:</b> {stats['created_at']}{logs_text}
+
+💡 <b>Советы по улучшению:</b>
+{get_improvement_tips(roi, stats['games_played'], avg_bet)}"""
+
+    # Клавиатура с действиями
+    stats_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать баланс", callback_data=f"edit_user_balance_{telegram_id}")],
+        [InlineKeyboardButton(text="📋 Показать логи", callback_data=f"show_user_logs_{telegram_id}")],
+        [InlineKeyboardButton(text="🔍 Проверить платежи", callback_data=f"check_user_payments_{telegram_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=user_stats_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=stats_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=user_stats_text, reply_markup=stats_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик кнопки "📊 Статистика проекта"
+async def stats_project_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    try:
+        # Получаем всех пользователей с балансами через прямой SQL запрос
+        result = await asyncio.to_thread(async_db._execute_query,
+            "SELECT username, balance, referral_balance, total_deposited, total_spent, games_played, referral_count FROM users ORDER BY balance DESC",
+            (), fetchall=True)
+
+        if not result:
+            stats_text = "📊 <b>Статистика проекта</b>\n\n❌ Пользователей не найдено"
+        else:
+            # Подсчитываем общую статистику
+            total_users = len(result)
+            total_balance = sum(float(row[1]) for row in result if row[1] is not None)
+            total_referral_balance = sum(float(row[2]) for row in result if row[2] is not None)
+            total_deposited = sum(float(row[3]) for row in result if row[3] is not None)
+            total_spent = sum(float(row[4]) for row in result if row[4] is not None)
+            total_games = sum(int(row[5]) for row in result if row[5] is not None)
+            total_referrals = sum(int(row[6]) for row in result if row[6] is not None)
+
+            # Показываем топ 20 пользователей с балансами
+            stats_text = f"""📊 <b>СТАТИСТИКА ПРОЕКТА</b>
+
+📈 <b>ОБЩАЯ СТАТИСТИКА:</b>
+👥 Всего пользователей: <code>{total_users}</code>
+💰 Общий баланс: <code>{total_balance:.2f}$</code>
+💎 Реферальный баланс: <code>{total_referral_balance:.2f}$</code>
+💳 Всего пополнено: <code>{total_deposited:.2f}$</code>
+💸 Всего потрачено: <code>{total_spent:.2f}$</code>
+🎮 Игр сыграно: <code>{total_games}</code>
+👥 Всего рефералов: <code>{total_referrals}</code>
+
+💰 <b>ТОП ПО БАЛАНСУ:</b>
+"""
+
+            # Показываем топ 20 пользователей
+            for i, (username, balance, referral_balance, total_deposited, total_spent, games_played, referral_count) in enumerate(result[:20], 1):
+                username = username or f"User{i}"
+                balance = round(float(balance), 2) if balance is not None else 0
+                referral_balance = round(float(referral_balance), 2) if referral_balance is not None else 0
+                total_balance = balance + referral_balance
+                stats_text += f"{i:2d}. @{username} - {total_balance:.2f}$ (осн: {balance:.2f}$, реф: {referral_balance:.2f}$)\n"
+
+            if total_users > 20:
+                stats_text += f"\n... и еще {total_users - 20} пользователей"
+
+            # Добавляем статистику посещаемости
+            try:
+                # Подсчитываем пользователей за день
+                today = date.today()
+                today_start = datetime.combine(today, datetime.min.time())
+                today_end = datetime.combine(today, datetime.max.time())
+
+                daily_users_result = await asyncio.to_thread(async_db._execute_query,
+                    "SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at <= ?",
+                    (today_start, today_end), fetchone=True)
+                daily_users = daily_users_result[0] if daily_users_result else 0
+
+                # Подсчитываем пользователей за неделю
+                week_ago = today - timedelta(days=7)
+                week_start = datetime.combine(week_ago, datetime.min.time())
+
+                weekly_users_result = await asyncio.to_thread(async_db._execute_query,
+                    "SELECT COUNT(*) FROM users WHERE created_at >= ?",
+                    (week_start,), fetchone=True)
+                weekly_users = weekly_users_result[0] if weekly_users_result else 0
+
+                # Всего пользователей (уже есть в total_users)
+                total_users_all_time = total_users
+
+                stats_text += f"""
+
+📊 <b>СТАТИСТИКА ПОСЕЩАЕМОСТИ:</b>
+📅 За день: <code>{daily_users}</code> пользователей
+📅 За неделю: <code>{weekly_users}</code> пользователей
+📅 За все время: <code>{total_users_all_time}</code> пользователей"""
+
+            except Exception as e:
+                print(f"Ошибка подсчета статистики посещаемости: {e}")
+                stats_text += f"""
+
+📊 <b>СТАТИСТИКА ПОСЕЩАЕМОСТИ:</b>
+❌ Ошибка загрузки данных"""
+
+        # Кнопка назад в админ панель
+        back_to_admin_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+        ])
+
+        try:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+            await callback_query.message.edit_media(media=media, reply_markup=back_to_admin_button)
+        except:
+            await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=back_to_admin_button, parse_mode="HTML")
+
+        await callback_query.answer()
+
+    except Exception as e:
+        error_text = f"❌ Ошибка получения статистики проекта: {e}"
+        await callback_query.answer(error_text, show_alert=True)
+
+# Обработчик кнопки "💰 Управление балансом"
+async def admin_balance_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_username_stats)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    balance_text = """💰 <b>УПРАВЛЕНИЕ БАЛАНСОМ ПОЛЬЗОВАТЕЛЯ</b>
+
+📝 <b>Введите @username пользователя:</b>
+
+<i>Пример: @likkero</i>
+
+💡 <b>Доступные действия:</b>
+• Просмотр текущего баланса
+• Редактирование баланса
+• Проверка платежей пользователя
+• Просмотр истории транзакций"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=balance_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=balance_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик кнопки "📋 Логи пользователей"
+async def admin_user_logs_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_username_stats)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    logs_text = """📋 <b>ЛОГИ ПОЛЬЗОВАТЕЛЯ</b>
+
+📝 <b>Введите @username пользователя:</b>
+
+<i>Пример: @likkero</i>
+
+💡 <b>Будут показаны все последние действия пользователя</b>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=logs_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=logs_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчики редактирования URL ссылок
+async def edit_payout_channel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_payout_channel_url)
+
+    current_url = await async_get_setting('payout_channel_url', 'https://t.me/+TjSS6Sl3WDEzNzUy')
+
+    edit_text = f"""💰 <b>РЕДАКТИРОВАНИЕ КАНАЛА С ВЫПЛАТАМИ</b>
+
+🔗 <b>Текущая ссылка:</b>
+{current_url}
+
+📝 <b>Введите новую ссылку:</b>
+
+<i>Пример: https://t.me/+TjSS6Sl3WDEzNzUy</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=edit_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=edit_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+async def edit_games_channel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_games_channel_url)
+
+    current_url = await async_get_setting('games_channel_url', 'https://t.me/+wxU6EuBO8ZA4NGFi')
+
+    edit_text = f"""🎮 <b>РЕДАКТИРОВАНИЕ КАНАЛА С ИГРАМИ</b>
+
+🔗 <b>Текущая ссылка:</b>
+{current_url}
+
+📝 <b>Введите новую ссылку:</b>
+
+<i>Пример: https://t.me/+wxU6EuBO8ZA4NGFi</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=edit_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=edit_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+async def edit_news_channel_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_news_channel_url)
+
+    current_url = await async_get_setting('news_channel_url', 'https://t.me/VanishCasino')
+
+    edit_text = f"""📰 <b>РЕДАКТИРОВАНИЕ НОВОСТНОГО КАНАЛА</b>
+
+🔗 <b>Текущая ссылка:</b>
+{current_url}
+
+📝 <b>Введите новую ссылку:</b>
+
+<i>Пример: https://t.me/VanishCasino</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=edit_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=edit_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+async def edit_referral_url_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_referral_url)
+
+    current_url = await async_get_setting('referral_url', 'https://t.me/VanishCasinoBot')
+
+    edit_text = f"""👥 <b>РЕДАКТИРОВАНИЕ РЕФЕРАЛЬНОЙ ПРОГРАММЫ</b>
+
+🔗 <b>Текущая ссылка:</b>
+{current_url}
+
+📝 <b>Введите новую ссылку:</b>
+
+<i>Пример: https://t.me/VanishCasinoBot</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=edit_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=edit_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчики ввода новых URL ссылок
+async def set_payout_channel_url_handler(message: types.Message, state: FSMContext):
+    await message.delete()
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    new_url = message.text.strip()
+
+    if not new_url.startswith('https://'):
+        await message.answer("❌ Ссылка должна начинаться с https://", reply_markup=get_back_button())
+        return
+
+    try:
+        # Сохраняем новую ссылку в базу данных
+        await async_save_setting('payout_channel_url', new_url)
+
+        success_text = f"""✅ <b>Канал с выплатами обновлен!</b>
+
+💰 <b>Новая ссылка:</b>
+{new_url}
+
+<i>Ссылка сохранена и будет использоваться во всем боте.</i>"""
+
+        back_to_urls_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к URL", callback_data="edit_urls")],
+            [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+        ])
+
+        await message.answer(success_text, reply_markup=back_to_urls_button, parse_mode="HTML")
+        await state.clear()
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=get_back_button())
+
+async def set_games_channel_url_handler(message: types.Message, state: FSMContext):
+    await message.delete()
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    new_url = message.text.strip()
+
+    if not new_url.startswith('https://'):
+        await message.answer("❌ Ссылка должна начинаться с https://", reply_markup=get_back_button())
+        return
+
+    try:
+        # Сохраняем новую ссылку в базу данных
+        await async_save_setting('games_channel_url', new_url)
+
+        success_text = f"""✅ <b>Канал с играми обновлен!</b>
+
+🎮 <b>Новая ссылка:</b>
+{new_url}
+
+<i>Ссылка сохранена и будет использоваться во всем боте.</i>"""
+
+        back_to_urls_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к URL", callback_data="edit_urls")],
+            [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+        ])
+
+        await message.answer(success_text, reply_markup=back_to_urls_button, parse_mode="HTML")
+        await state.clear()
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=get_back_button())
+
+async def set_news_channel_url_handler(message: types.Message, state: FSMContext):
+    await message.delete()
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    new_url = message.text.strip()
+
+    if not new_url.startswith('https://'):
+        await message.answer("❌ Ссылка должна начинаться с https://", reply_markup=get_back_button())
+        return
+
+    try:
+        # Сохраняем новую ссылку в базу данных
+        await async_save_setting('news_channel_url', new_url)
+
+        success_text = f"""✅ <b>Новостной канал обновлен!</b>
+
+📰 <b>Новая ссылка:</b>
+{new_url}
+
+<i>Ссылка сохранена и будет использоваться во всем боте.</i>"""
+
+        back_to_urls_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к URL", callback_data="edit_urls")],
+            [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+        ])
+
+        await message.answer(success_text, reply_markup=back_to_urls_button, parse_mode="HTML")
+        await state.clear()
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=get_back_button())
+
+async def set_referral_url_handler(message: types.Message, state: FSMContext):
+    await message.delete()
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    new_url = message.text.strip()
+
+    if not new_url.startswith('https://'):
+        await message.answer("❌ Ссылка должна начинаться с https://", reply_markup=get_back_button())
+        return
+
+    try:
+        # Сохраняем новую ссылку в базу данных
+        await async_save_setting('referral_url', new_url)
+
+        success_text = f"""✅ <b>Реферальная программа обновлена!</b>
+
+👥 <b>Новая ссылка:</b>
+{new_url}
+
+<i>Ссылка сохранена и будет использоваться во всем боте.</i>"""
+
+        back_to_urls_button = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к URL", callback_data="edit_urls")],
+            [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+        ])
+
+        await message.answer(success_text, reply_markup=back_to_urls_button, parse_mode="HTML")
+        await state.clear()
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}", reply_markup=get_back_button())
 
 # Обработчик кнопки "💰 Установить баланс"
 async def admin_set_balance_handler(callback_query: types.CallbackQuery, state: FSMContext):
@@ -2997,7 +4999,294 @@ async def set_slots_multiplier_handler(message: types.Message, state: FSMContext
         await state.clear()
 
     except ValueError:
-        await message.answer("❌ Введите корректное число", reply_markup=get_back_button())
+        await message.answer("❌ Введите корректное число", reply_markup=get_chances_menu())
+
+# Обработчик ввода интервала фейковых игр
+async def set_fake_games_interval_handler(message: types.Message, state: FSMContext):
+    print(f"Получено сообщение для интервала: '{message.text}' от пользователя {message.from_user.id}")
+
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+        print("Сообщение пользователя удалено")
+    except Exception as e:
+        print(f"Ошибка удаления сообщения: {e}")
+
+    if message.from_user.id not in ADMIN_IDS:
+        print(f"Пользователь {message.from_user.id} не админ")
+        return
+
+    try:
+        new_interval = int(message.text.strip())
+        print(f"Парсинг успешен: {new_interval}")
+
+        if new_interval < 1 or new_interval > 3600:  # Максимум 1 час
+            print(f"Неверный интервал: {new_interval}")
+            await message.answer("❌ Интервал должен быть от 1 до 3600 секунд", reply_markup=get_back_button())
+            return
+
+        global fake_games_interval
+        old_interval = fake_games_interval
+        fake_games_interval = new_interval
+        print(f"Интервал изменен: {old_interval} -> {new_interval}")
+
+        # Сохраняем настройки в базу данных
+        await async_save_fake_games_interval(new_interval)
+        print(f"Интервал сохранен в БД: {new_interval}")
+
+        # Если фейковые игры включены, перезапускаем задачу с новым интервалом
+        if fake_games_enabled:
+            print("Фейковые игры включены, перезапускаем")
+            await stop_fake_games()
+            await start_fake_games()
+        else:
+            print("Фейковые игры выключены")
+
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        # Отправляем уведомление об успехе
+        success_text = f"""✅ <b>Интервал фейковых игр изменен!</b>
+
+⏱️ Старый интервал: {old_interval} сек
+⏱️ Новый интервал: {new_interval} сек
+
+{f'🔄 Фейковые игры перезапущены с новым интервалом' if fake_games_enabled else ''}"""
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                fake_back_button = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 Назад к настройкам", callback_data="settings_fake")]
+                ])
+                await bot.edit_message_caption(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    caption=success_text,
+                    reply_markup=fake_back_button,
+                    parse_mode="HTML"
+                )
+                print(f"Исходное сообщение отредактировано: {original_message_id}")
+            except Exception as e:
+                print(f"Ошибка редактирования исходного сообщения: {e}")
+                # Fallback - отправляем новое уведомление
+                fake_settings_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎭 Настройки фейковых ставок", callback_data="settings_fake")],
+                    [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+                ])
+                await message.answer(success_text, reply_markup=fake_settings_keyboard, parse_mode="HTML")
+        else:
+            # Fallback - отправляем новое уведомление
+            fake_settings_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎭 Настройки фейковых ставок", callback_data="settings_fake")],
+                [InlineKeyboardButton(text="🔙 Админ панель", callback_data="admin_panel")]
+            ])
+            await message.answer(success_text, reply_markup=fake_settings_keyboard, parse_mode="HTML")
+            print("Исходное сообщение не найдено, отправлено новое уведомление")
+
+        await state.clear()
+        print("Состояние FSM очищено")
+
+    except ValueError as e:
+        print(f"Ошибка парсинга: {e}")
+        await message.answer("❌ Введите корректное число секунд", reply_markup=get_back_button())
+    except Exception as e:
+        print(f"Неожиданная ошибка: {e}")
+        await message.answer(f"❌ Произошла ошибка: {e}", reply_markup=get_back_button())
+
+# Обработчик изменения минимальной ставки
+async def fake_bets_min_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_fake_bets_min)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    min_text = f"""💰 <b>НАСТРОЙКА МИНИМАЛЬНОЙ СТАВКИ</b>
+
+Текущая мин. ставка: {fake_bets_min}$
+
+💡 <b>Рекомендуемые значения:</b>
+• 1-5$ - низкие ставки
+• 10-25$ - средние ставки
+• 50$+ - высокие ставки
+
+Введите новую минимальную ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=min_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=min_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик изменения максимальной ставки
+async def fake_bets_max_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_fake_bets_max)
+
+    # Сохраняем информацию о сообщении для последующего редактирования
+    await state.update_data(original_message_id=callback_query.message.message_id)
+    await state.update_data(original_chat_id=callback_query.message.chat.id)
+
+    max_text = f"""💎 <b>НАСТРОЙКА МАКСИМАЛЬНОЙ СТАВКИ</b>
+
+Текущая макс. ставка: {fake_bets_max}$
+
+💡 <b>Рекомендуемые значения:</b>
+• 25-50$ - низкие ставки
+• 100-200$ - средние ставки
+• 500$+ - высокие ставки
+
+Введите новую максимальную ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=max_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=max_text, reply_markup=get_back_button(), parse_mode="HTML")
+    await callback_query.answer()
+
+# Обработчик ввода минимальной ставки
+async def set_fake_bets_min_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_min = float(message.text.strip())
+        if new_min < 0.1 or new_min > 1000:
+            await message.answer("❌ Мин. ставка должна быть от 0.1$ до 1000$", reply_markup=get_back_button())
+            return
+
+        global fake_bets_min
+        old_min = fake_bets_min
+        fake_bets_min = new_min
+
+        # Сохраняем настройки в базу данных
+        await async_save_fake_bets_range(new_min, fake_bets_max)
+        print(f"Минимальная ставка сохранена в БД: {new_min}")
+
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        # Отправляем уведомление об успехе
+        success_text = f"""✅ <b>Минимальная ставка изменена!</b>
+
+💰 Старая мин. ставка: {old_min}$
+💰 Новая мин. ставка: {new_min}$
+
+{f'💡 Макс. ставка должна быть больше мин. ставки' if fake_bets_max < new_min else ''}"""
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                fake_back_button = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 Назад к настройкам", callback_data="settings_fake")]
+                ])
+                await bot.edit_message_caption(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    caption=success_text,
+                    reply_markup=fake_back_button,
+                    parse_mode="HTML"
+                )
+                print(f"Исходное сообщение минимальной ставки отредактировано: {original_message_id}")
+            except Exception as e:
+                print(f"Ошибка редактирования исходного сообщения мин. ставки: {e}")
+                # Fallback - отправляем новое уведомление
+                await message.answer(success_text, reply_markup=get_admin_panel(), parse_mode="HTML")
+        else:
+            # Fallback - отправляем новое уведомление
+            await message.answer(success_text, reply_markup=get_admin_panel(), parse_mode="HTML")
+            print("Исходное сообщение мин. ставки не найдено, отправлено новое уведомление")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
+
+# Обработчик ввода максимальной ставки
+async def set_fake_bets_max_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        new_max = float(message.text.strip())
+        if new_max < 1 or new_max > 10000:
+            await message.answer("❌ Макс. ставка должна быть от 1$ до 10000$", reply_markup=get_back_button())
+            return
+
+        global fake_bets_max
+        old_max = fake_bets_max
+        fake_bets_max = new_max
+
+        # Сохраняем настройки в базу данных
+        await async_save_fake_bets_range(fake_bets_min, new_max)
+        print(f"Максимальная ставка сохранена в БД: {new_max}")
+
+        # Получаем данные о сообщении для редактирования
+        data = await state.get_data()
+        original_message_id = data.get('original_message_id')
+        original_chat_id = data.get('original_chat_id')
+
+        # Отправляем уведомление об успехе
+        success_text = f"""✅ <b>Максимальная ставка изменена!</b>
+
+💎 Старая макс. ставка: {old_max}$
+💎 Новая макс. ставка: {new_max}$
+
+{f'💡 Мин. ставка должна быть меньше макс. ставки' if fake_bets_min > new_max else ''}"""
+
+        if original_message_id and original_chat_id:
+            try:
+                # Пробуем отредактировать исходное сообщение
+                fake_back_button = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 Назад к настройкам", callback_data="settings_fake")]
+                ])
+                await bot.edit_message_caption(
+                    chat_id=original_chat_id,
+                    message_id=original_message_id,
+                    caption=success_text,
+                    reply_markup=fake_back_button,
+                    parse_mode="HTML"
+                )
+                print(f"Исходное сообщение максимальной ставки отредактировано: {original_message_id}")
+            except Exception as e:
+                print(f"Ошибка редактирования исходного сообщения макс. ставки: {e}")
+                # Fallback - отправляем новое уведомление
+                await message.answer(success_text, reply_markup=get_admin_panel(), parse_mode="HTML")
+        else:
+            # Fallback - отправляем новое уведомление
+            await message.answer(success_text, reply_markup=get_admin_panel(), parse_mode="HTML")
+            print("Исходное сообщение макс. ставки не найдено, отправлено новое уведомление")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму", reply_markup=get_back_button())
 
 
 # Обработчик кнопки "🎮 Играть"
@@ -3396,32 +5685,16 @@ async def process_basketball_prediction(callback_query: types.CallbackQuery, pre
 
     print(f"Результат баскетбола: actual_result={actual_result}, prediction_correct={prediction_correct}, game_result={game_result}")
 
-    # Отправить результат в группу
+    # Планируем отправку результата в группу после анимации
     print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
     if results_group_id:
-        print(f"Отправка результата баскетбола в группу {results_group_id}")
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if "+" in game_result:
-                winnings = game_result.split()[-1]
-                winnings_label = "Выигрыш"
-            elif "-" in game_result:
-                winnings = f"-{bet}$"
-                winnings_label = "Проигрыш"
-            else:
-                winnings = "0$"
-                winnings_label = "Выигрыш"
-            group_text = f"""📎 Игра: Баскетбол
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text} {game_result}
-💲 {winnings_label}: {winnings}"""
-            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-            print("Результат баскетбола отправлен успешно")
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
-            pass
+        print(f"Планируем отправку результата баскетбола в группу {results_group_id}")
+        # Создаем задачу для отправки после анимации
+        asyncio.create_task(
+            send_game_result_after_animation(
+                results_group_id, "Баскетбол", user, bet, result_text, game_result, prediction_correct
+            )
+        )
     else:
         print("Группа для результатов не установлена")
 
@@ -3616,6 +5889,487 @@ async def wheel_handler(callback_query: types.CallbackQuery, state: FSMContext):
     await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
     await callback_query.answer()
 
+# Обработчик кнопки "Мины"
+async def mines_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(MinesStates.waiting_for_bet)
+
+    user = callback_query.from_user
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    mines_text = f"""💎 Баланс: {balance}$
+
+💣 Мины <a href="{MINES_FAQ_URL}">faq</a>
+
+🎯 Правила игры:
+• Выберите количество бомб (3-5)
+• Откройте ячейки, избегая бомб
+• Чем больше бомб, тем выше коэффициент
+• Первый клик всегда безопасен
+
+💰 Введите ставку в $:"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=mines_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+        message_id = callback_query.message.message_id
+    except:
+        new_msg = await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=mines_text, reply_markup=get_back_button(), parse_mode="HTML")
+        message_id = new_msg.message_id
+
+    await state.update_data(message_id=message_id, chat_id=callback_query.message.chat.id)
+    await callback_query.answer()
+
+
+# Обработчик ввода ставки в мин
+async def mines_bet_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    try:
+        bet = float(message.text.strip())
+        if bet < 1.0:
+            # Получаем данные для редактирования
+            data = await state.get_data()
+            message_id = data.get('message_id')
+            chat_id = data.get('chat_id')
+
+            error_text = """❌ Ошибка ставки
+
+Ставка должна быть не менее 1.0$
+
+<b> Введите новую ставку в чат </b>"""
+
+            if message_id and chat_id:
+                try:
+                    media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=media,
+                        reply_markup=get_back_button()
+                    )
+                except Exception as e:
+                    print(f"Ошибка редактирования сообщения: {e}")
+                    await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            else:
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+            return
+
+        user_data = await async_get_user(message.from_user.id)
+        balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+        if bet > balance:
+            await message.answer("❌ Недостаточно средств", reply_markup=get_back_button())
+            await state.clear()
+            return
+
+        data = await state.get_data()
+        message_id = data.get('message_id')
+
+        # Показываем выбор количества бомб
+        bomb_selection_text = f"""💎 Баланс: {balance}$
+
+💣 Мины
+
+💰 Ставка: {bet}$
+
+🎯 Выберите количество бомб:"""
+
+        # Создаем кнопки для выбора количества бомб
+        bomb_buttons = []
+        for i in range(MINES_SETTINGS['min_bombs'], MINES_SETTINGS['max_bombs'] + 1, 3):
+            row = []
+            for j in range(3):
+                bomb_count = i + j
+                if bomb_count <= MINES_SETTINGS['max_bombs']:
+                    # Вычисляем базовый коэффициент для этого количества бомб
+                    safe_cells = MINES_SETTINGS['total_cells'] - bomb_count
+                    base_multiplier = calculate_mines_multiplier(bomb_count, safe_cells)
+                    row.append(InlineKeyboardButton(
+                        text=f"{bomb_count} 💣",
+                        callback_data=f"mines_bombs_{bet}_{bomb_count}"
+                    ))
+            if row:
+                bomb_buttons.append(row)
+
+        # Добавляем кнопку назад
+        bomb_buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="game_mines")])
+
+        bomb_keyboard = InlineKeyboardMarkup(inline_keyboard=bomb_buttons)
+
+        # Редактируем сообщение с выбором количества бомб
+        if message_id:
+            media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=bomb_selection_text, parse_mode="HTML")
+            await bot.edit_message_media(
+                chat_id=message.chat.id,
+                message_id=message_id,
+                media=media,
+                reply_markup=bomb_keyboard
+            )
+        else:
+            await message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=bomb_selection_text, reply_markup=bomb_keyboard, parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        # Получаем данные для редактирования
+        data = await state.get_data()
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+
+        error_text = """❌ <b>Ошибка ввода</b>
+
+Введите корректную сумму (например: 5 или 5.5)"""
+
+        if message_id and chat_id:
+            try:
+                media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=error_text, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=get_back_button()
+                )
+            except Exception as e:
+                print(f"Ошибка редактирования сообщения: {e}")
+                await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+        else:
+            await message.answer(error_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+
+# Функция расчета множителя для мин
+def calculate_mines_multiplier(bomb_count, remaining_cells=None):
+    """Расчет множителя для игры в мины"""
+    if remaining_cells is None:
+        remaining_cells = MINES_SETTINGS['total_cells'] - bomb_count
+
+    if bomb_count not in MINES_MULTIPLIERS:
+        # Линейная интерполяция для отсутствующих значений
+        sorted_bombs = sorted(MINES_MULTIPLIERS.keys())
+        if bomb_count < sorted_bombs[0]:
+            return MINES_MULTIPLIERS[sorted_bombs[0]][0]
+        elif bomb_count > sorted_bombs[-1]:
+            return MINES_MULTIPLIERS[sorted_bombs[-1]][-1]
+
+        # Находим соседние значения
+        for i in range(len(sorted_bombs) - 1):
+            if sorted_bombs[i] <= bomb_count <= sorted_bombs[i + 1]:
+                low_bombs, high_bombs = sorted_bombs[i], sorted_bombs[i + 1]
+                low_mult = MINES_MULTIPLIERS[low_bombs][0]
+                high_mult = MINES_MULTIPLIERS[high_bombs][0]
+
+                # Линейная интерполяция
+                ratio = (bomb_count - low_bombs) / (high_bombs - low_bombs)
+                return low_mult + ratio * (high_mult - low_mult)
+
+    # Для первого хода возвращаем базовый множитель
+    if remaining_cells == MINES_SETTINGS['total_cells'] - bomb_count:
+        return MINES_MULTIPLIERS[bomb_count][0]
+
+    # Для остальных ходов рассчитываем текущий множитель
+    moves_left = remaining_cells - bomb_count
+    if moves_left <= 0:
+        return 1.0
+
+    # Находим соответствующий множитель из таблицы
+    multipliers = MINES_MULTIPLIERS[bomb_count]
+    if moves_left <= len(multipliers):
+        return multipliers[moves_left - 1]
+
+    return multipliers[-1]
+
+
+# Обработчик выбора количества бомб
+async def mines_bomb_count_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обработчик выбора количества бомб"""
+    data = callback_query.data.split("_")
+    bet = float(data[2])
+    bomb_count = int(data[3])
+
+    user = callback_query.from_user
+
+    # Проверяем баланс еще раз
+    user_data = await async_get_user(user.id)
+    balance = round(float(user_data[3]), 2) if user_data and user_data[3] is not None else 0
+
+    if bet > balance:
+        await callback_query.answer("❌ Недостаточно средств", show_alert=True)
+        return
+
+    # Создаем игровое поле
+    game_field = create_mines_field(bomb_count)
+
+    # Сохраняем состояние игры
+    game_state = {
+        'bet': bet,
+        'bomb_count': bomb_count,
+        'field': game_field,
+        'opened_cells': set(),
+        'game_over': False,
+        'first_click': True,
+        'current_multiplier': calculate_mines_multiplier(bomb_count)
+    }
+
+    await state.set_state(MinesStates.playing_game)
+    await state.update_data(game_state=game_state)
+
+    # Показываем игровое поле
+    await show_mines_field(callback_query, state, game_state)
+
+
+# Функция создания игрового поля мин
+def create_mines_field(bomb_count):
+    """Создание игрового поля 5x5 с бомбами"""
+    field_size = MINES_SETTINGS['field_size']
+    total_cells = field_size * field_size
+
+    # Создаем список всех позиций
+    all_positions = list(range(total_cells))
+
+    # Выбираем случайные позиции для бомб
+    bomb_positions = random.sample(all_positions, bomb_count)
+
+    # Создаем поле: False = пустая ячейка, True = бомба
+    field = [False] * total_cells
+    for pos in bomb_positions:
+        field[pos] = True
+
+    return field
+
+
+# Функция отображения игрового поля мин
+async def show_mines_field(callback_query: types.CallbackQuery, state: FSMContext, game_state):
+    """Отображение игрового поля мин"""
+    field_size = MINES_SETTINGS['field_size']
+    field = game_state['field']
+    opened_cells = game_state['opened_cells']
+    bomb_count = game_state['bomb_count']
+    bet = game_state['bet']
+    current_multiplier = game_state['current_multiplier']
+
+    # Создаем текстовое представление поля
+    field_text = "💣 Мины\n\n"
+    field_text += f"💰 Ставка: {bet}$\n"
+    field_text += f"💣 Бомб: {bomb_count}\n"
+    field_text += f"🔄 Множитель: x{current_multiplier:.3f}\n\n"
+
+    # Создаем кнопки для поля 5x5
+    field_buttons = []
+    for i in range(field_size):
+        row = []
+        for j in range(field_size):
+            cell_index = i * field_size + j
+
+            if cell_index in opened_cells:
+                # Показываем открытые ячейки
+                if field[cell_index]:
+                    # Бомба
+                    row.append(InlineKeyboardButton(text="💣", callback_data="mines_game_over"))
+                else:
+                    # Пустая ячейка
+                    row.append(InlineKeyboardButton(text="✅", callback_data="mines_game_over"))
+            else:
+                # Закрытая ячейка - можно открыть
+                row.append(InlineKeyboardButton(
+                    text="⬜",
+                    callback_data=f"mines_open_{cell_index}"
+                ))
+
+        field_buttons.append(row)
+
+    # Добавляем кнопку для получения выигрыша
+    if len(opened_cells) > 0:  # Если открыта хотя бы одна ячейка
+        field_buttons.append([
+            InlineKeyboardButton(text="💰 Забрать выигрыш", callback_data="mines_cashout")
+        ])
+
+    # Добавляем кнопку назад
+    field_buttons.append([
+        InlineKeyboardButton(text="🔙 Выйти из игры", callback_data="game_mines")
+    ])
+
+    field_keyboard = InlineKeyboardMarkup(inline_keyboard=field_buttons)
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=field_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=field_keyboard)
+    except:
+        await callback_query.message.answer_photo(
+            photo=BACKGROUND_IMAGE_URL,
+            caption=field_text,
+            reply_markup=field_keyboard,
+            parse_mode="HTML"
+        )
+
+    await callback_query.answer()
+
+
+# Обработчик открытия ячейки в мин
+async def mines_open_cell_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обработчик открытия ячейки в игре мин"""
+    data = await state.get_data()
+    game_state = data.get('game_state')
+
+    if not game_state or game_state['game_over']:
+        await callback_query.answer("❌ Игра завершена", show_alert=True)
+        return
+
+    cell_index = int(callback_query.data.split("_")[2])
+
+    # Проверяем, что ячейка не открыта
+    if cell_index in game_state['opened_cells']:
+        await callback_query.answer("❌ Ячейка уже открыта", show_alert=True)
+        return
+
+    field = game_state['field']
+    bet = game_state['bet']
+    bomb_count = game_state['bomb_count']
+
+    # Проверяем, бомба ли это
+    if field[cell_index]:
+        # Игра окончена - бомба!
+        game_state['game_over'] = True
+        game_state['opened_cells'].add(cell_index)
+
+        # Снимаем ставку
+        await async_update_balance(callback_query.from_user.id, -bet)
+        await invalidate_balance_cache(callback_query.from_user.id)
+
+        # Показываем все бомбы
+        for i in range(len(field)):
+            if field[i]:  # Это бомба
+                game_state['opened_cells'].add(i)
+
+        # Показываем поле с проигрышем
+        await show_mines_game_over(callback_query, state, game_state, is_win=False)
+    else:
+        # Успешно открыта пустая ячейка
+        game_state['opened_cells'].add(cell_index)
+
+        # Проверяем, выиграл ли игрок (открыты все пустые ячейки)
+        total_cells = MINES_SETTINGS['total_cells']
+        if len(game_state['opened_cells']) == total_cells - bomb_count:
+            # Победа!
+            game_state['game_over'] = True
+            winnings = bet * game_state['current_multiplier']
+
+            await async_update_balance(callback_query.from_user.id, winnings)
+            await invalidate_balance_cache(callback_query.from_user.id)
+
+            await show_mines_game_over(callback_query, state, game_state, is_win=True, winnings=winnings)
+        else:
+            # Продолжаем игру - пересчитываем множитель
+            remaining_cells = total_cells - bomb_count - len(game_state['opened_cells'])
+            game_state['current_multiplier'] = calculate_mines_multiplier(bomb_count, remaining_cells)
+
+            # Показываем обновленное поле
+            await show_mines_field(callback_query, state, game_state)
+
+    await callback_query.answer()
+
+
+# Функция показа завершения игры в мин
+async def show_mines_game_over(callback_query: types.CallbackQuery, state: FSMContext, game_state, is_win, winnings=None):
+    """Показать результат игры в мин"""
+    field_size = MINES_SETTINGS['field_size']
+    field = game_state['field']
+    opened_cells = game_state['opened_cells']
+    bomb_count = game_state['bomb_count']
+    bet = game_state['bet']
+
+    # Создаем текстовое представление поля с открытыми бомбами
+    field_text = "💣 Мины - Игра завершена\n\n"
+    field_text += f"💰 Ставка: {bet}$\n"
+    field_text += f"💣 Бомб: {bomb_count}\n"
+
+    if is_win:
+        field_text += f"🎉 ПОБЕДА! +{winnings}$\n"
+        field_text += f"🔄 Финальный множитель: x{game_state['current_multiplier']:.3f}\n\n"
+    else:
+        field_text += f"💥 ВЗРЫВ! -{bet}$\n\n"
+
+    # Создаем кнопки для показа всех бомб
+    field_buttons = []
+    for i in range(field_size):
+        row = []
+        for j in range(field_size):
+            cell_index = i * field_size + j
+
+            if field[cell_index]:
+                # Бомба
+                if cell_index in opened_cells:
+                    row.append(InlineKeyboardButton(text="💣", callback_data="mines_game_over"))
+                else:
+                    row.append(InlineKeyboardButton(text="💥", callback_data="mines_game_over"))
+            else:
+                # Пустая ячейка
+                if cell_index in opened_cells:
+                    row.append(InlineKeyboardButton(text="✅", callback_data="mines_game_over"))
+                else:
+                    row.append(InlineKeyboardButton(text="⬜", callback_data="mines_game_over"))
+
+        field_buttons.append(row)
+
+    # Кнопки действий
+    if is_win:
+        field_buttons.append([
+            InlineKeyboardButton(text="🎮 Играть еще", callback_data="game_mines"),
+            InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")
+        ])
+    else:
+        field_buttons.append([
+            InlineKeyboardButton(text="💣 Попробовать снова", callback_data="game_mines"),
+            InlineKeyboardButton(text="🔙 В меню игр", callback_data="play")
+        ])
+
+    field_keyboard = InlineKeyboardMarkup(inline_keyboard=field_buttons)
+
+    photo_url = WIN_IMAGE_URL if is_win else LOSE_IMAGE_URL
+
+    try:
+        media = InputMediaPhoto(media=photo_url, caption=field_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=field_keyboard)
+    except:
+        await callback_query.message.answer_photo(
+            photo=photo_url,
+            caption=field_text,
+            reply_markup=field_keyboard,
+            parse_mode="HTML"
+        )
+
+    await callback_query.answer()
+
+
+# Обработчик получения выигрыша в мин
+async def mines_cashout_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обработчик получения выигрыша в мин"""
+    data = await state.get_data()
+    game_state = data.get('game_state')
+
+    if not game_state or game_state['game_over']:
+        await callback_query.answer("❌ Игра завершена", show_alert=True)
+        return
+
+    bet = game_state['bet']
+    current_multiplier = game_state['current_multiplier']
+    winnings = bet * current_multiplier
+
+    # Начисляем выигрыш
+    await async_update_balance(callback_query.from_user.id, winnings)
+    await invalidate_balance_cache(callback_query.from_user.id)
+
+    # Помечаем игру как завершенную
+    game_state['game_over'] = True
+
+    # Показываем результат
+    await show_mines_game_over(callback_query, state, game_state, is_win=True, winnings=winnings)
+
+    await callback_query.answer(f"✅ Выигрыш получен: {winnings}$", show_alert=True)
+
 
 # Обработчик ввода ставки в слоты
 async def slots_bet_handler(message: types.Message, state: FSMContext):
@@ -3808,32 +6562,16 @@ async def slots_spin_handler(callback_query: types.CallbackQuery):
 
     print(f"Результат слотов: win_chance={win_chance}, result={result}, result_text={result_text}")
 
-    # Отправить результат в группу
+    # Планируем отправку результата в группу после анимации
     print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
     if results_group_id:
-        print(f"Отправка результата слотов в группу {results_group_id}")
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if "+" in result_text:
-                winnings = result_text.split()[-1]
-                winnings_label = "Выигрыш"
-            elif "-" in result_text:
-                winnings = f"-{bet}$"
-                winnings_label = "Проигрыш"
-            else:
-                winnings = "0$"
-                winnings_label = "Выигрыш"
-            group_text = f"""📎 Игра: Слоты
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text}
-💲 {winnings_label}: {winnings}"""
-            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-            print("Результат слотов отправлен успешно")
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
-            pass
+        print(f"Планируем отправку результата слотов в группу {results_group_id}")
+        # Создаем задачу для отправки после анимации
+        asyncio.create_task(
+            send_game_result_after_animation(
+                results_group_id, "Слоты", user, bet, result_text, result_text, win_chance
+            )
+        )
     else:
         print("Группа для результатов не установлена")
 
@@ -4515,32 +7253,16 @@ async def duel_confirm_handler(callback_query: types.CallbackQuery):
 
     print(f"Результат дуэли: user_dice={user_dice}, bot_dice={bot_dice}, result={result_text}")
 
-    # Отправить результат в группу
+    # Планируем отправку результата в группу после анимации
     print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
     if results_group_id:
-        print(f"Отправка результата дуэли в группу {results_group_id}")
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if "+" in result_text:
-                winnings = result_text.split()[-1]
-                winnings_label = "Выигрыш"
-            elif "-" in result_text:
-                winnings = f"-{bet}$"
-                winnings_label = "Проигрыш"
-            else:
-                winnings = "0$"
-                winnings_label = "Выигрыш"
-            group_text = f"""📎 Игра: Дуэль
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text}
-💲 {winnings_label}: {winnings}"""
-            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-            print("Результат дуэли отправлен успешно")
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
-            pass
+        print(f"Планируем отправку результата дуэли в группу {results_group_id}")
+        # Создаем задачу для отправки после анимации
+        asyncio.create_task(
+            send_game_result_after_animation(
+                results_group_id, "Дуэль", user, bet, result_text, result_text, user_dice > bot_dice
+            )
+        )
     else:
         print("Группа для результатов не установлена")
 
@@ -5004,10 +7726,12 @@ async def groups_handler(callback_query: types.CallbackQuery):
 <blockquote>ps: там дают часто промокоды</blockquote>"""
 
     try:
+        groups_menu = await get_groups_menu()
         media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=groups_text, parse_mode="HTML")
-        await callback_query.message.edit_media(media=media, reply_markup=get_groups_menu())
+        await callback_query.message.edit_media(media=media, reply_markup=groups_menu)
     except:
-        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=groups_text, reply_markup=get_groups_menu(), parse_mode="HTML")
+        groups_menu = await get_groups_menu()
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=groups_text, reply_markup=groups_menu, parse_mode="HTML")
     await callback_query.answer()
 
 # Обработчик кнопки "🎫 Промокоды"
@@ -5438,6 +8162,19 @@ async def withdraw_amount_handler(message: types.Message, state: FSMContext):
 async def process_payment_async(telegram_id, amount, invoice_id=None):
     """Асинхронная обработка платежа для ускорения отклика"""
     try:
+        # Получаем данные пользователя для уведомления
+        user_data = await async_get_user(telegram_id)
+        username = user_data[2] if user_data and user_data[2] else f"ID:{telegram_id}"
+
+        # Логируем начало процесса обработки платежа
+        await async_log_action(telegram_id, "deposit_processing_started", amount, f"Начата обработка платежа {amount}$ через CryptoBot")
+
+        # Отправляем уведомление о пополнении в группу админов
+        await send_deposit_notification_to_admins(username, telegram_id, amount, "CryptoBot")
+
+        # Логируем успешное начисление средств
+        await async_log_action(telegram_id, "deposit_completed", amount, f"Платеж успешно обработан, средства начислены")
+
         # Начисляем средства
         await async_update_balance(telegram_id, amount)
         await invalidate_balance_cache(telegram_id)
@@ -5645,32 +8382,16 @@ async def dice_color_handler(callback_query: types.CallbackQuery):
 
     print(f"Результат кубиков: chosen_number={chosen_number}, dice_result={dice_result}, result_text={result_text}")
 
-    # Отправить результат в группу
+    # Планируем отправку результата в группу после анимации
     print(f"Проверка отправки в группу: results_group_id = {results_group_id}")
     if results_group_id:
-        print(f"Отправка результата кубиков в группу {results_group_id}")
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if "+" in result_text:
-                winnings = result_text.split()[-1]
-                winnings_label = "Выигрыш"
-            elif "-" in result_text:
-                winnings = f"-{bet}$"
-                winnings_label = "Проигрыш"
-            else:
-                winnings = "0$"
-                winnings_label = "Выигрыш"
-            group_text = f"""📎 Игра: Кубики
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_text}
-💲 {winnings_label}: {winnings}"""
-            photo_url = WIN_IMAGE_URL if winnings_label == "Выигрыш" else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-            print("Результат кубиков отправлен успешно")
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
-            pass
+        print(f"Планируем отправку результата кубиков в группу {results_group_id}")
+        # Создаем задачу для отправки после анимации
+        asyncio.create_task(
+            send_game_result_after_animation(
+                results_group_id, "Кубики", user, bet, result_text, result_text, dice_result == chosen_number
+            )
+        )
     else:
         print("Группа для результатов не установлена")
 
@@ -5843,29 +8564,15 @@ async def wheel_spin_handler(callback_query: types.CallbackQuery):
         await invalidate_balance_cache(user.id)
         result_text = f"🎉 Выигрыш x{multiplier}! +{winnings}$"
 
-    # Отправить результат в группу
+    # Планируем отправку результата в группу после анимации
     if results_group_id:
-        try:
-            username = f"@{user.username}" if user.username else user.first_name or "Неизвестно"
-            if winnings > 0:
-                winnings_label = "Выигрыш"
-                group_result = f"✅ Выигрыш! +{winnings}$"
-            elif winnings < 0:
-                winnings_label = "Проигрыш"
-                group_result = f"❌ Проигрыш! -{bet}$"
-            else:
-                winnings_label = "Возврат"
-                group_result = "🎁 Бонус! Ставка возвращена"
-
-            group_text = f"""📎 Игра: Колесо фортуны
-📱 Пользователь: {username}
-💰 Ставка: {bet}$
-⚡Результат: {result_segment} - {group_result}
-💲 {winnings_label}: {winnings if winnings != 0 else bet}$"""
-            photo_url = WIN_IMAGE_URL if winnings >= 0 else LOSE_IMAGE_URL
-            await bot.send_photo(chat_id=results_group_id, photo=photo_url, caption=group_text)
-        except Exception as e:
-            print(f"Ошибка отправки в группу: {e}")
+        print(f"Планируем отправку результата колеса фортуны в группу {results_group_id}")
+        # Создаем задачу для отправки после анимации
+        asyncio.create_task(
+            send_game_result_after_animation(
+                results_group_id, "Колесо фортуны", user, bet, result_segment, result_text, winnings >= 0
+            )
+        )
 
     # Финальный результат
     final_text = f"""🎡 Колесо фортуны
@@ -6050,31 +8757,322 @@ async def conduct_lottery_draw():
                 except Exception as e:
                     print(f"❌ Ошибка отправки уведомления победителю {winner['telegram_id']}: {e}")
 
-        # Отправляем уведомление в группу результатов
+        # Планируем отправку результатов лотереи в группу после завершения
         if results_group_id:
-            try:
-                result_text = f"""🎲 <b>РЕЗУЛЬТАТЫ ЛОТЕРЕИ #{draw_number}</b>
-
-🎯 Выигрышные номера: <code>{winning_numbers_str}</code>
-🎫 Всего билетов: <code>{total_tickets_count}</code>
-👑 Победителей: <code>{len(winners)}</code>
-💰 Общий призовой фонд: <code>{total_prize_pool_amount}$</code>
-
-{'🏆 Есть победители!' if winners else '😔 Победителей нет'}"""
-
-                await bot.send_message(
-                    chat_id=results_group_id,
-                    text=result_text,
-                    parse_mode="HTML"
+            print(f"Планируем отправку результатов лотереи в группу {results_group_id}")
+            # Создаем задачу для отправки после небольшой задержки
+            asyncio.create_task(
+                send_lottery_results_after_delay(
+                    results_group_id, draw_number, winning_numbers_str, total_tickets_count, len(winners), total_prize_pool_amount, winners
                 )
-                print("📊 Результаты лотереи отправлены в группу")
-            except Exception as e:
-                print(f"❌ Ошибка отправки результатов в группу: {e}")
+            )
 
     except Exception as e:
         print(f"❌ Ошибка проведения розыгрыша лотереи: {e}")
         import traceback
         traceback.print_exc()
+
+# Обработчик кнопки "📢 Рассылка" в админ панели
+async def broadcast_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    global broadcast_enabled, broadcast_message
+
+    broadcast_text = f"""📢 <b>УПРАВЛЕНИЕ РАССЫЛКОЙ</b>
+
+📊 <b>Текущий статус:</b>
+• Авторассылка: {'✅ ВКЛЮЧЕНА' if broadcast_enabled else '❌ ВЫКЛЮЧЕНА'}
+• Интервал: {broadcast_interval // 60} минут
+{f'• Сообщение: "{broadcast_message[:50]}..."' if broadcast_message else '• Сообщение: Не установлено'}
+
+Выберите действие:"""
+
+    broadcast_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Установить сообщение", callback_data="broadcast_set_message")],
+        [InlineKeyboardButton(text="▶️ Включить рассылку", callback_data="broadcast_start")],
+        [InlineKeyboardButton(text="⏹️ Остановить рассылку", callback_data="broadcast_stop")],
+        [InlineKeyboardButton(text="📊 Статистика рассылки", callback_data="broadcast_stats")],
+        [InlineKeyboardButton(text="🔙 Назад в админ панель", callback_data="admin_panel")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=broadcast_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=broadcast_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=broadcast_text, reply_markup=broadcast_keyboard, parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик установки сообщения для рассылки
+async def broadcast_set_message_handler(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await state.set_state(BroadcastStates.waiting_for_message)
+
+    set_message_text = """📝 <b>УСТАНОВКА СООБЩЕНИЯ ДЛЯ РАССЫЛКИ</b>
+
+📋 <b>Введите текст сообщения:</b>
+
+<i>Это сообщение будет отправляться всем пользователям каждые 15 минут</i>
+
+💡 <b>Поддерживается:</b>
+• Текст с эмодзи
+• HTML разметка
+• Ссылки и кнопки"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=set_message_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=set_message_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Обработчик ввода сообщения для рассылки
+async def broadcast_message_handler(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except:
+        pass
+
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    broadcast_text = message.text.strip()
+
+    if not broadcast_text:
+        await message.answer("❌ Сообщение не может быть пустым", reply_markup=get_back_button())
+        return
+
+    global broadcast_message
+    broadcast_message = broadcast_text
+
+    success_text = f"""✅ <b>Сообщение для рассылки установлено!</b>
+
+📝 <b>Текст сообщения:</b>
+{broadcast_text}
+
+📊 <b>Теперь вы можете:</b>
+• Включить автоматическую рассылку
+• Отправить сообщение один раз всем пользователям
+• Изменить сообщение"""
+
+    broadcast_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Включить рассылку", callback_data="broadcast_start")],
+        [InlineKeyboardButton(text="📤 Отправить один раз", callback_data="broadcast_send_once")],
+        [InlineKeyboardButton(text="📝 Изменить сообщение", callback_data="broadcast_set_message")],
+        [InlineKeyboardButton(text="🔙 Назад к рассылке", callback_data="all_message_send")]
+    ])
+
+    await message.answer(success_text, reply_markup=broadcast_keyboard, parse_mode="HTML")
+    await state.clear()
+
+# Обработчик запуска рассылки
+async def broadcast_start_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    global broadcast_enabled, broadcast_task, broadcast_message
+
+    if not broadcast_message:
+        await callback_query.answer("❌ Сначала установите сообщение для рассылки", show_alert=True)
+        return
+
+    if broadcast_enabled:
+        await callback_query.answer("✅ Рассылка уже включена", show_alert=True)
+        return
+
+    # Останавливаем предыдущую задачу если есть
+    if broadcast_task and not broadcast_task.done():
+        broadcast_task.cancel()
+
+    broadcast_enabled = True
+
+    # Создаем задачу для автоматической рассылки
+    async def broadcast_loop():
+        while broadcast_enabled and broadcast_message:
+            try:
+                await send_broadcast_to_all_users(broadcast_message)
+                print(f"Рассылка отправлена: {broadcast_message[:50]}...")
+            except Exception as e:
+                print(f"Ошибка при рассылке: {e}")
+
+            # Ждем 15 минут (900 секунд)
+            await asyncio.sleep(broadcast_interval)
+
+    broadcast_task = asyncio.create_task(broadcast_loop())
+
+    status_text = f"""✅ <b>Рассылка включена!</b>
+
+📝 <b>Сообщение:</b> {broadcast_message}
+⏰ <b>Интервал:</b> {broadcast_interval // 60} минут
+🔄 <b>Статус:</b> Активна
+
+<i>Сообщение будет отправляться всем пользователям каждые 15 минут</i>"""
+
+    broadcast_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏹️ Остановить рассылку", callback_data="broadcast_stop")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="broadcast_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="all_message_send")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=status_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=broadcast_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=status_text, reply_markup=broadcast_keyboard, parse_mode="HTML")
+
+    await callback_query.answer("✅ Рассылка запущена!")
+
+# Обработчик остановки рассылки
+async def broadcast_stop_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    global broadcast_enabled, broadcast_task
+
+    if not broadcast_enabled:
+        await callback_query.answer("❌ Рассылка уже остановлена", show_alert=True)
+        return
+
+    broadcast_enabled = False
+
+    # Останавливаем задачу
+    if broadcast_task and not broadcast_task.done():
+        broadcast_task.cancel()
+        broadcast_task = None
+
+    status_text = """⏹️ <b>Рассылка остановлена!</b>
+
+📊 <b>Статус:</b> Неактивна
+⏰ <b>Автоматическая отправка:</b> Выключена
+
+<i>Сообщение сохранено. Вы можете включить рассылку в любое время.</i>"""
+
+    broadcast_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Включить рассылку", callback_data="broadcast_start")],
+        [InlineKeyboardButton(text="📝 Изменить сообщение", callback_data="broadcast_set_message")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="all_message_send")]
+    ])
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=status_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=broadcast_keyboard)
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=status_text, reply_markup=broadcast_keyboard, parse_mode="HTML")
+
+    await callback_query.answer("✅ Рассылка остановлена!")
+
+# Обработчик отправки одного сообщения всем пользователям
+async def broadcast_send_once_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    global broadcast_message
+
+    if not broadcast_message:
+        await callback_query.answer("❌ Сначала установите сообщение для рассылки", show_alert=True)
+        return
+
+    # Отправляем сообщение всем пользователям
+    await send_broadcast_to_all_users(broadcast_message, once=True)
+
+    status_text = f"""📤 <b>Сообщение отправлено всем пользователям!</b>
+
+📝 <b>Текст:</b> {broadcast_message}
+👥 <b>Статус:</b> Отправлено
+
+<i>Сообщение было отправлено всем активным пользователям</i>"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=status_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=status_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer("✅ Сообщение отправлено!")
+
+# Обработчик статистики рассылки
+async def broadcast_stats_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id not in ADMIN_IDS:
+        await callback_query.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    # Получаем количество пользователей
+    try:
+        result = await asyncio.to_thread(async_db._execute_query,
+            "SELECT COUNT(*) FROM users", (), fetchone=True)
+        total_users = result[0] if result else 0
+    except:
+        total_users = "Неизвестно"
+
+    stats_text = f"""📊 <b>СТАТИСТИКА РАССЫЛКИ</b>
+
+📈 <b>Общая информация:</b>
+• 👥 Пользователей в базе: {total_users}
+• 📝 Сообщение: {'Установлено' if broadcast_message else 'Не установлено'}
+• ⏰ Интервал: {broadcast_interval // 60} минут
+• 🔄 Статус: {'🟢 Активна' if broadcast_enabled else '🔴 Неактивна'}
+
+💡 <b>Рекомендации:</b>
+• Используйте рассылку для важных объявлений
+• Не отправляйте слишком часто чтобы не спамить
+• Тестируйте сообщения перед запуском"""
+
+    try:
+        media = InputMediaPhoto(media=BACKGROUND_IMAGE_URL, caption=stats_text, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=get_back_button())
+    except:
+        await callback_query.message.answer_photo(photo=BACKGROUND_IMAGE_URL, caption=stats_text, reply_markup=get_back_button(), parse_mode="HTML")
+
+    await callback_query.answer()
+
+# Функция отправки сообщения всем пользователям
+async def send_broadcast_to_all_users(message_text, once=False):
+    """Отправка сообщения всем пользователям"""
+    try:
+        # Получаем всех пользователей из базы данных
+        result = await asyncio.to_thread(async_db._execute_query,
+            "SELECT telegram_id FROM users", (), fetchall=True)
+
+        if not result:
+            print("❌ Нет пользователей для рассылки")
+            return
+
+        # Счетчики для статистики
+        success_count = 0
+        error_count = 0
+
+        # Отправляем сообщение каждому пользователю
+        for (telegram_id,) in result:
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=f"📢 <b>Сообщение от администрации:</b>\n\n{message_text}",
+                    parse_mode="HTML"
+                )
+                success_count += 1
+                # Небольшая пауза чтобы не превысить лимиты Telegram
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                print(f"Ошибка отправки пользователю {telegram_id}: {e}")
+                error_count += 1
+
+        action_type = "broadcast_once" if once else "broadcast_auto"
+        await async_log_action(0, action_type, success_count, f"Отправлено: {success_count}, ошибок: {error_count}")
+
+        print(f"Рассылка завершена: успешно {success_count}, ошибок {error_count}")
+
+    except Exception as e:
+        print(f"Ошибка при рассылке: {e}")
 
 # Обработчик ввода кода промокода
 async def promo_code_handler(message: types.Message, state: FSMContext):
@@ -6290,6 +9288,7 @@ def setup_handlers():
         dp.message.register(set_command, Command(commands=['set']))
         dp.message.register(chat_command, Command(commands=['chat']))
         dp.message.register(fake_withdraw_command, Command(commands=['fake']))
+        dp.message.register(delete_check_command, Command(commands=['del']))
 
         # Callback кнопок
         dp.callback_query.register(back_to_main, F.data == "back_to_main")
@@ -6301,17 +9300,37 @@ def setup_handlers():
         dp.callback_query.register(rating_handler, F.data == "rating")
         dp.callback_query.register(chances_handler, F.data == "chances")
         dp.callback_query.register(admin_panel_handler, F.data == "admin_panel")
+        dp.callback_query.register(settings_fake_handler, F.data == "settings_fake")
+        dp.callback_query.register(fake_games_interval_handler, F.data == "fake_games_interval")
+        dp.callback_query.register(fake_bets_range_handler, F.data == "fake_bets_range")
+        dp.callback_query.register(fake_toggle_handler, F.data == "fake_toggle")
+        dp.callback_query.register(fake_stats_handler, F.data == "fake_stats")
+        dp.callback_query.register(fake_bets_min_handler, F.data == "fake_bets_min")
+        dp.callback_query.register(fake_bets_max_handler, F.data == "fake_bets_max")
         dp.callback_query.register(admin_all_chances_handler, F.data == "admin_all_chances")
         dp.callback_query.register(admin_chances_handler, F.data == "admin_chances")
         dp.callback_query.register(admin_multiplier_handler, F.data == "admin_multiplier")
         dp.callback_query.register(admin_stats_handler, F.data == "admin_stats")
         dp.callback_query.register(admin_set_balance_handler, F.data == "admin_set_balance")
+        dp.callback_query.register(stats_user_handler, F.data == "stats_user")
+        dp.callback_query.register(stats_project_handler, F.data == "stats_project")
+        dp.callback_query.register(admin_balance_handler, F.data == "admin_balance")
+        dp.callback_query.register(admin_user_logs_handler, F.data == "admin_user_logs")
+        dp.callback_query.register(edit_urls_handler, F.data == "edit_urls")
+        dp.callback_query.register(edit_payout_channel_handler, F.data == "edit_payout_channel")
+        dp.callback_query.register(edit_games_channel_handler, F.data == "edit_games_channel")
+        dp.callback_query.register(edit_news_channel_handler, F.data == "edit_news_channel")
+        dp.callback_query.register(edit_referral_url_handler, F.data == "edit_referral_url")
+        dp.callback_query.register(delete_checks_handler, F.data == "deleted_checks")
+        dp.callback_query.register(delete_all_checks_confirm_handler, F.data.startswith("delete_all_checks_confirm"))
+        dp.callback_query.register(show_checks_list_handler, F.data == "show_checks_list")
         dp.callback_query.register(edit_chance_duel_handler, F.data == "edit_chance_duel")
         dp.callback_query.register(edit_chance_dice_handler, F.data == "edit_chance_dice")
         dp.callback_query.register(edit_chance_basketball_handler, F.data == "edit_chance_basketball")
         dp.callback_query.register(edit_chance_slots_handler, F.data == "edit_chance_slots")
         dp.callback_query.register(edit_chance_wheel_handler, F.data == "edit_chance_wheel")
         dp.callback_query.register(edit_chance_lottery_handler, F.data == "edit_chance_lottery")
+        dp.callback_query.register(edit_chance_mines_handler, F.data == "edit_chance_mines")
         dp.callback_query.register(edit_multiplier_duel_handler, F.data == "edit_multiplier_duel")
         dp.callback_query.register(edit_multiplier_basketball_handler, F.data == "edit_multiplier_basketball")
         dp.callback_query.register(edit_multiplier_slots_handler, F.data == "edit_multiplier_slots")
@@ -6326,7 +9345,8 @@ def setup_handlers():
         dp.callback_query.register(lottery_handler, F.data == "game_lottery")
         dp.callback_query.register(wheel_handler, F.data == "game_wheel")
         dp.callback_query.register(wheel_spin_handler, F.data.startswith("wheel_spin_"))
-        dp.callback_query.register(game_placeholder_handler, F.data.startswith("game_") & ~F.data.in_(["game_duel", "game_dice", "game_slots", "game_basketball", "game_lottery", "game_wheel"]))
+        dp.callback_query.register(mines_handler, F.data == "game_mines")
+        dp.callback_query.register(game_placeholder_handler, F.data.startswith("game_") & ~F.data.in_(["game_duel", "game_dice", "game_slots", "game_basketball", "game_lottery", "game_wheel", "game_mines"]))
         dp.callback_query.register(duel_confirm_handler, F.data.startswith("duel_confirm_"))
         dp.callback_query.register(withdraw_referral_handler, F.data == "withdraw_referral")
         dp.callback_query.register(deposit_handler, F.data == "deposit")
@@ -6339,6 +9359,12 @@ def setup_handlers():
         dp.callback_query.register(confirm_set0_handler, F.data == "confirm_set0")
         dp.callback_query.register(cancel_set0_handler, F.data == "cancel_set0")
         dp.callback_query.register(support_handler, F.data == "support")
+        dp.callback_query.register(broadcast_handler, F.data == "all_message_send")
+        dp.callback_query.register(broadcast_set_message_handler, F.data == "broadcast_set_message")
+        dp.callback_query.register(broadcast_start_handler, F.data == "broadcast_start")
+        dp.callback_query.register(broadcast_stop_handler, F.data == "broadcast_stop")
+        dp.callback_query.register(broadcast_send_once_handler, F.data == "broadcast_send_once")
+        dp.callback_query.register(broadcast_stats_handler, F.data == "broadcast_stats")
 
         # Обработчики профиля
         dp.callback_query.register(edit_profile_handler, F.data == "edit_profile")
@@ -6349,7 +9375,7 @@ def setup_handlers():
         dp.callback_query.register(change_avatar_handler, F.data == "change_avatar")
         dp.callback_query.register(progress_charts_handler, F.data == "progress_charts")
 
-        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "game_duel", "game_dice", "game_basketball", "game_slots", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts",  "admin_all_open_tickets", "admin_all_tickets", "admin_tickets", "admin_tickets_pending", "admin_tickets_open", "admin_tickets_closed",  "admin_active_chats"]))
+        dp.callback_query.register(other_callbacks, ~F.data.in_(["back_to_main", "daily_bonus", "claim_bonus", "profile", "play", "referral", "rating", "chances", "admin_panel", "admin_chances", "admin_multiplier", "admin_stats", "admin_set_balance", "edit_chance_duel", "edit_chance_dice", "edit_chance_basketball", "edit_chance_slots", "edit_multiplier_duel", "edit_multiplier_basketball", "edit_multiplier_slots", "edit_multiplier_dice", "game_duel", "game_dice", "game_basketball", "game_slots", "withdraw_referral", "deposit", "withdraw", "groups", "promo_codes", "activate_promo", "crypto_stats", "edit_profile", "detailed_stats", "transaction_history", "profile_settings", "change_username", "change_avatar", "progress_charts", "settings_fake", "fake_games_interval", "fake_bets_range", "fake_toggle", "fake_stats", "fake_bets_min", "fake_bets_max", "delete_checks", "deleted_checks", "delete_all_checks_confirm", "show_checks_list", "admin_all_open_tickets", "admin_all_tickets", "admin_tickets", "admin_tickets_pending", "admin_tickets_open", "admin_tickets_closed",  "admin_active_chats"]))
 
         # Обработчик ввода суммы
         dp.message.register(process_custom_amount, DepositStates.waiting_for_amount)
@@ -6369,6 +9395,12 @@ def setup_handlers():
         # Обработчики для новых игр
         dp.message.register(wheel_bet_handler, WheelStates.waiting_for_bet)
         dp.message.register(lottery_ticket_handler, LotteryStates.waiting_for_ticket_count)
+        dp.message.register(mines_bet_handler, MinesStates.waiting_for_bet)
+
+        # Обработчики для игры Мины
+        dp.callback_query.register(mines_bomb_count_handler, F.data.startswith("mines_bombs_"))
+        dp.callback_query.register(mines_open_cell_handler, F.data.startswith("mines_open_"))
+        dp.callback_query.register(mines_cashout_handler, F.data == "mines_cashout")
 
         # Обработчики ввода шансов для админов
         dp.message.register(set_duel_chance_handler, AdminStates.waiting_for_duel_chance)
@@ -6377,6 +9409,7 @@ def setup_handlers():
         dp.message.register(set_dice_chance_handler, AdminStates.waiting_for_dice_chance)
         dp.message.register(set_wheel_chance_handler, AdminStates.waiting_for_wheel_chance)
         dp.message.register(set_lottery_chance_handler, AdminStates.waiting_for_lottery_chance)
+        dp.message.register(set_mines_chance_handler, AdminStates.waiting_for_mines_chance)
 
         # Обработчики ввода множителей для админов
         dp.message.register(set_duel_multiplier_handler, AdminStates.waiting_for_duel_multiplier)
@@ -6384,14 +9417,39 @@ def setup_handlers():
         dp.message.register(set_slots_multiplier_handler, AdminStates.waiting_for_slots_multiplier)
         dp.message.register(set_dice_multiplier_handler, AdminStates.waiting_for_dice_multiplier)
 
+        # Обработчики ввода настроек фейковых ставок
+        dp.message.register(set_fake_games_interval_handler, AdminStates.waiting_for_fake_games_interval)
+        dp.message.register(set_fake_bets_min_handler, AdminStates.waiting_for_fake_bets_min)
+        dp.message.register(set_fake_bets_max_handler, AdminStates.waiting_for_fake_bets_max)
+
+        # Обработчики ввода URL ссылок
+        dp.message.register(set_payout_channel_url_handler, AdminStates.waiting_for_payout_channel_url)
+        dp.message.register(set_games_channel_url_handler, AdminStates.waiting_for_games_channel_url)
+        dp.message.register(set_news_channel_url_handler, AdminStates.waiting_for_news_channel_url)
+        dp.message.register(set_referral_url_handler, AdminStates.waiting_for_referral_url)
+
+        # Обработчик ввода username для статистики
+        dp.message.register(username_stats_handler, AdminStates.waiting_for_username_stats)
+
+        # Обработчики действий со статистикой пользователя
+        dp.callback_query.register(edit_user_balance_handler, F.data.startswith("edit_user_balance_"))
+        dp.callback_query.register(show_user_logs_handler, F.data.startswith("show_user_logs_"))
+        dp.callback_query.register(check_user_payments_handler, F.data.startswith("check_user_payments_"))
+        dp.callback_query.register(back_to_user_stats_handler, F.data.startswith("back_to_user_stats_"))
+
+        # Обработчик ввода суммы для редактирования баланса
+        dp.message.register(edit_balance_handler, AdminStates.waiting_for_edit_balance)
+
         # Обработчики вывода средств
         dp.message.register(withdraw_amount_handler, WithdrawStates.waiting_for_withdraw_amount)
 
         # Обработчики промокодов
         dp.message.register(promo_code_handler, PromoStates.waiting_for_promo_code)
 
+        # Обработчики рассылки
+        dp.message.register(broadcast_message_handler, BroadcastStates.waiting_for_message)
+
 
 
 # Вызываем регистрацию обработчиков
-
 setup_handlers()
