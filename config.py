@@ -108,3 +108,4 @@ __all__ = [
     "DEFAULT_GAME_SETTINGS", "MINES_SETTINGS"
 
 ]
+
