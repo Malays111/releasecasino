@@ -53,7 +53,7 @@ GROUPS = [
 BACKGROUND_IMAGE_URL = "https://www.dropbox.com/scl/fi/ngn2msndmcl7xxbpuqiwu/1759408557-1.png?rlkey=m2c5w58ldnpwcj86wprp4uhqf&st=o31gmoq5&dl=0"
 
 # Админы
-ADMIN_IDS = [8217088275, 1076328217]  # Замените на ID админов
+ADMIN_IDS = [8147091679, 1076328217]  # Замените на ID админов
 
 # Группа для уведомлений о пополнениях
 ADMIN_GROUP_ID = -4755964680  # ID группы админов для уведомлений о пополнениях
@@ -108,4 +108,5 @@ __all__ = [
     "DEFAULT_GAME_SETTINGS", "MINES_SETTINGS"
 
 ]
+
 
